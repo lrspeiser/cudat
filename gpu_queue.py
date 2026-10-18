@@ -3,6 +3,7 @@ import argparse
 from collections import deque
 import contextlib
 import ctypes
+import hashlib
 from ctypes import wintypes as W
 import json
 import math
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import gpu_failures
 
 ROOT = Path(__file__).resolve().parent
 def default_state_dir():
@@ -51,10 +53,17 @@ def connect(state=None):
                            'pause_supported': 'INTEGER DEFAULT 0', 'checkpoint': 'TEXT',
                            'resume_command': 'TEXT', 'resumed_from': 'INTEGER',
                            'resumed_as': 'INTEGER', 'share_gpu': 'INTEGER DEFAULT 0',
-                           'compute_percent': 'REAL DEFAULT 100'}.items():
+                           'compute_percent': 'REAL DEFAULT 100', 'requester': 'TEXT',
+                           'retry_of': 'INTEGER', 'retry_key': 'TEXT', 'retry_signature': 'TEXT',
+                           'depends_on': "TEXT DEFAULT '[]'"}.items():
             if name not in columns:
                 db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {kind}')
         db.execute('CREATE TABLE IF NOT EXISTS queue_events (time REAL, action TEXT, data TEXT)')
+        db.execute('CREATE UNIQUE INDEX IF NOT EXISTS retry_once ON jobs(retry_of,retry_key) WHERE retry_of IS NOT NULL')
+        db.execute('''CREATE TABLE IF NOT EXISTS failure_notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER UNIQUE,
+            requester TEXT NOT NULL, created REAL, packet TEXT, acknowledged REAL)''')
+        db.execute('CREATE INDEX IF NOT EXISTS requester_inbox ON failure_notifications(requester,acknowledged,id)')
     return db
 
 
@@ -92,11 +101,91 @@ def claim_head(db, jid, **values):
     """Recheck after telemetry: a concurrent reorder/cancel must win admission."""
     with db:
         db.execute('BEGIN IMMEDIATE')
-        ids = queued_ids(db)
-        if not ids or ids[0] != jid:
+        row, _ = next_candidate(db)
+        if row is None or row['id'] != jid:
             return False
         db.execute('UPDATE jobs SET '+','.join(k+'=?' for k in values)+' WHERE id=?', [*values.values(), jid])
     return True
+
+
+def validate_dependencies(db, ids):
+    if not isinstance(ids, list) or any(type(j) is not int or not 1 <= j <= 2**63-1 for j in ids) or len(ids) != len(set(ids)):
+        raise ValueError('Dependencies must be distinct positive existing job IDs')
+    for jid in ids:
+        if db.execute('SELECT id FROM jobs WHERE id=?', (jid,)).fetchone() is None:
+            raise ValueError(f'Unknown prerequisite {jid}')
+
+
+def dependency_state(db, row):
+    ids = json.loads(row['depends_on'] or '[]')
+    waiting = []
+    for jid in ids:
+        parent = db.execute('SELECT status,resumed_as FROM jobs WHERE id=?', (jid,)).fetchone()
+        seen = {jid}
+        while parent and parent[0]=='paused' and parent[1] is not None:
+            if parent[1] in seen:
+                return 'blocked', f'Prerequisite job {jid} has an invalid resume lineage.'
+            seen.add(parent[1])
+            parent=db.execute('SELECT status,resumed_as FROM jobs WHERE id=?',(parent[1],)).fetchone()
+        if not parent or parent[0] in (*gpu_failures.FAILURE_STATES, 'cancelled'):
+            return 'blocked', f'Prerequisite job {jid} did not complete successfully; repair it and retry with the replacement dependency.'
+        if parent[0] != 'completed':
+            waiting.append(jid)
+    return ('waiting', 'Waiting for prerequisite jobs '+', '.join(map(str, waiting))) if waiting else ('ready', '')
+
+
+def next_candidate(db):
+    message = ''
+    for row in db.execute(f"SELECT * FROM jobs WHERE status='queued' ORDER BY {QUEUE_ORDER}").fetchall():
+        state, detail = dependency_state(db, row)
+        if state != 'waiting':
+            return row, detail if state == 'blocked' else ''
+        message = message or detail
+    return None, message
+
+
+def retry(db, jid, *, retry_key, mode, command=None, cwd=None, vram_gb=None, minutes=None,
+          max_minutes=None, depends_on=None, exclusive=False):
+    if not isinstance(retry_key, str) or not 1 <= len(retry_key) <= 120 or any(ord(c)<32 for c in retry_key):
+        raise ValueError('retry-key must contain 1–120 characters without control characters')
+    if mode not in ('checkpoint', 'start'):
+        raise ValueError('Explicitly choose checkpoint or start retry mode')
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT * FROM jobs WHERE id=?', (jid,)).fetchone()
+        if row is None or row['status'] not in gpu_failures.FAILURE_STATES:
+            raise ValueError('Only failed, interrupted, timed-out, rejected or blocked jobs can be retried')
+        if mode == 'checkpoint':
+            if command is not None or not row['checkpoint'] or not Path(row['checkpoint']).exists() or not row['resume_command']:
+                raise ValueError('Checkpoint retry requires an existing registered checkpoint/resume command, with no command override')
+            argv = json.loads(row['resume_command'])
+        else:
+            argv = command if command is not None else json.loads(row['command'])
+        if not isinstance(argv, list) or not argv or any(not isinstance(x,str) or '\x00' in x for x in argv):
+            raise ValueError('Command must be a nonempty argument array')
+        directory = Path(cwd or row['cwd']).expanduser().resolve()
+        if not directory.is_dir():
+            raise ValueError('Retry cwd must exist')
+        memory = positive(str(vram_gb)) if vram_gb is not None else row['vram']
+        seconds = positive(str(minutes))*60 if minutes is not None else row['seconds']
+        limit = positive(str(max_minutes))*60 if max_minutes is not None else row['limit_seconds']
+        dependencies = json.loads(row['depends_on'] or '[]') if depends_on is None else depends_on
+        validate_dependencies(db, dependencies)
+        values = dict(project=row['project'], command=json.dumps(argv), cwd=str(directory), vram=memory, seconds=seconds,
+            limit_seconds=limit, requester=row['requester'], depends_on=json.dumps(dependencies), retry_of=jid,
+            retry_key=retry_key, share_gpu=0 if exclusive else row['share_gpu'], compute_percent=100 if exclusive else row['compute_percent'])
+        signature = hashlib.sha256(json.dumps(dict(mode=mode, **values), sort_keys=True).encode()).hexdigest()
+        existing = db.execute('SELECT id,retry_signature FROM jobs WHERE retry_of=? AND retry_key=?', (jid,retry_key)).fetchone()
+        if existing:
+            if signature != existing['retry_signature']:
+                raise ValueError('retry-key was already used with different options; inspect the original retry')
+            return dict(job_id=existing['id'], retry_of=jid, replayed=True)
+        if db.execute("SELECT id FROM jobs WHERE retry_of=? AND status IN ('queued','running','paused')", (jid,)).fetchone():
+            raise ValueError('A retry for this failed attempt is already queued, running or paused')
+        values.update(retry_signature=signature, submitted=time.time(), queue_order=next_order(db))
+        cur = db.execute('INSERT INTO jobs('+','.join(values)+') VALUES ('+','.join('?' for _ in values)+')', list(values.values()))
+        event(db, 'retry', job_id=jid, retry_job_id=cur.lastrowid, mode=mode, retry_key=retry_key)
+    return dict(job_id=cur.lastrowid, retry_of=jid, status='queued', replayed=False)
 
 
 def pause(db, jid):
@@ -124,8 +213,8 @@ def resume(db, jid):
         if row['checkpoint']:
             if not Path(row['checkpoint']).exists() or not row['resume_command']:
                 raise ValueError('Saved checkpoint or resume command is unavailable.')
-            cur = db.execute('INSERT INTO jobs(project,command,cwd,vram,seconds,limit_seconds,submitted,queue_order,resumed_from,share_gpu,compute_percent) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-                (row['project'], row['resume_command'], row['cwd'], row['vram'], row['seconds'], row['limit_seconds'], time.time(), next_order(db), jid, row['share_gpu'], row['compute_percent']))
+            cur = db.execute('INSERT INTO jobs(project,command,cwd,vram,seconds,limit_seconds,submitted,queue_order,resumed_from,share_gpu,compute_percent,requester,depends_on) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                (row['project'], row['resume_command'], row['cwd'], row['vram'], row['seconds'], row['limit_seconds'], time.time(), next_order(db), jid, row['share_gpu'], row['compute_percent'],row['requester'],row['depends_on']))
             new_id = cur.lastrowid
             db.execute('UPDATE jobs SET resumed_as=? WHERE id=?', (new_id, jid))
         else:
@@ -144,6 +233,15 @@ def with_progress(row):
             data['progress'] = progress
     except (OSError, ValueError, TypeError):
         pass
+    return data
+
+
+def job_report(db, row):
+    data = with_progress(row)
+    packet = db.execute('SELECT id,packet,acknowledged FROM failure_notifications WHERE job_id=?', (row['id'],)).fetchone()
+    if packet:
+        data['failure'] = dict(notification_id=packet['id'], acknowledged=packet['acknowledged'], **json.loads(packet['packet']))
+    data['artifacts'] = str(STATE / 'jobs' / str(row['id']))
     return data
 
 
@@ -291,6 +389,7 @@ def run_job(db, row, device, before, interval, heartbeat=None, stop_event=None):
         with open(folder / 'output.log', 'wb') as out, open(folder / 'metrics.jsonl', 'a', encoding='utf-8') as metrics:
             env = os.environ.copy()
             env.update(CUDA_VISIBLE_DEVICES=before['uuid'], GPU_QUEUE_STATE_DIR=str(STATE.resolve()), GPU_QUEUE_JOB_ID=str(jid),
+                       GPU_QUEUE_REQUESTER=row['requester'] or 'project:'+row['project'],
                        GPU_QUEUE_SHARE_GPU=str(int(row['share_gpu'])), GPU_QUEUE_COMPUTE_PERCENT=str(row['compute_percent']),
                        GPU_QUEUE_VRAM_GB=str(row['vram']), GPU_QUEUE_EXPECTED_SECONDS=str(row['seconds']))
             # The launcher waits for GO before spawning user code, preventing a process-tree race.
@@ -363,6 +462,7 @@ def run_job(db, row, device, before, interval, heartbeat=None, stop_event=None):
         report['estimated_vram_difference_gb'] = peak - row['vram']
         report['memory_measurement'] = 'Sampled whole-GPU usage minus pre-job baseline; other applications and concurrent jobs affect this estimate. Not per-job allocation.'
         (folder / 'report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+        gpu_failures.record(db, STATE, jid)
         print(f'Job {jid}: {status}, {elapsed:.1f}s, estimated peak {peak:.2f} GiB', flush=True)
 
 
@@ -408,7 +508,7 @@ def worker(args, db):
         baseline = 0.0
         def heartbeat(state, detail):
             payload = dict(time=time.time(), state=state, detail=detail, reserve_gb=args.reserve_gb,
-                version='0.3.0', queue_order_supported=True, sharing_supported=True,
+                version='0.4.0', queue_order_supported=True, sharing_supported=True, failure_notifications_supported=True,
                 max_parallel=args.max_parallel, compute_reserve_percent=args.compute_reserve_percent,
                 running_job_ids=list(running))
             pending = STATE / 'worker.tmp'
@@ -423,6 +523,7 @@ def worker(args, db):
 
         try:
             while True:
+                gpu_failures.reconcile(db, STATE)
                 for jid, thread in list(running.items()):
                     if not thread.is_alive():
                         thread.join()
@@ -436,12 +537,15 @@ def worker(args, db):
                     heartbeat('stopped', 'Stop requested; all active jobs finished.')
                     print('Worker stopped after finishing its current jobs.', flush=True)
                     return
-                row = None if stopping else db.execute(f"SELECT * FROM jobs WHERE status='queued' ORDER BY {QUEUE_ORDER} LIMIT 1").fetchone()
+                row, dependency_message = (None, '') if stopping else next_candidate(db)
+                if row is not None and dependency_message:
+                    claim_head(db,row['id'],status='blocked',ended=time.time(),detail=dependency_message)
+                    continue
                 active = [dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='running'")]
                 if row is None:
                     recent.clear()
-                    heartbeat('running' if running else 'idle', 'Finishing active jobs.' if running else 'No queued jobs.')
-                    if args.once and not running:
+                    heartbeat('running' if running else 'waiting' if dependency_message else 'idle', dependency_message or ('Finishing active jobs.' if running else 'No queued jobs.'))
+                    if args.once and not running and not dependency_message:
                         return
                     time.sleep(args.poll)
                     continue
@@ -516,6 +620,8 @@ def main():
     submit.add_argument('--max-minutes', type=positive, help='Optional enforced runtime limit')
     submit.add_argument('--share-gpu', action='store_true', help='Allow overlap only with other consenting shared jobs.')
     submit.add_argument('--compute-percent', type=percent, help='Required with --share-gpu: expected GPU compute demand (estimate, not a cap).')
+    submit.add_argument('--requester', default=os.environ.get('GPU_QUEUE_REQUESTER'), help='Stable submitting agent/session ID for failure delivery; defaults to project inbox when omitted.')
+    submit.add_argument('--after', type=int, action='append', default=[], help='Prerequisite job ID; repeat for multiple prerequisites.')
     submit.add_argument('--cwd', type=Path, default=Path.cwd())
     submit.add_argument('command', nargs=argparse.REMAINDER)
     work = commands.add_parser('worker')
@@ -539,6 +645,27 @@ def main():
     order = commands.add_parser('reorder', help='Supply all currently queued IDs in desired execution order.')
     order.add_argument('job_ids', type=int, nargs='+')
     order.add_argument('--expected-order', type=int, nargs='*', help='Reject if the queue has changed since this snapshot.')
+    again = commands.add_parser('retry', help='Create an explicit linked retry; original failure and logs are retained.')
+    again.add_argument('id', type=int)
+    again.add_argument('--retry-key', required=True, help='Stable idempotency key for this repair attempt.')
+    choice = again.add_mutually_exclusive_group(required=True)
+    choice.add_argument('--from-checkpoint', action='store_true')
+    choice.add_argument('--from-start', action='store_true')
+    again.add_argument('--vram-gb', type=positive)
+    again.add_argument('--minutes', type=positive)
+    again.add_argument('--max-minutes', type=positive)
+    again.add_argument('--cwd', type=Path)
+    again.add_argument('--after', type=int, nargs='*', default=None, help='Replace prerequisite list (empty clears it explicitly).')
+    again.add_argument('--exclusive', action='store_true', help='Disable GPU sharing for the retry.')
+    again.add_argument('--command-json', help='Replacement argument array for --from-start.')
+    inbox = commands.add_parser('notifications', help='Read durable failure packets for a requester.')
+    inbox.add_argument('--requester', default=os.environ.get('GPU_QUEUE_REQUESTER'), required=not bool(os.environ.get('GPU_QUEUE_REQUESTER')))
+    inbox.add_argument('--include-acked', action='store_true')
+    inbox.add_argument('--after', type=int, default=0)
+    inbox.add_argument('--wait', type=float, default=0, help='Long poll up to 30 seconds.')
+    ack = commands.add_parser('acknowledge', help='Acknowledge a notification without deleting its evidence.')
+    ack.add_argument('id', type=int)
+    ack.add_argument('--requester', default=os.environ.get('GPU_QUEUE_REQUESTER'), required=not bool(os.environ.get('GPU_QUEUE_REQUESTER')))
     for name in ('report', 'cancel', 'wait', 'pause', 'resume'):
         p = commands.add_parser(name)
         p.add_argument('id', type=int)
@@ -546,6 +673,7 @@ def main():
     STATE = args.state_dir.expanduser().resolve() if args.state_dir else default_state_dir()
     db = connect()
     if args.action == 'submit':
+        owner = gpu_failures.requester_id(args.requester or 'project:' + args.project)
         if args.share_gpu != (args.compute_percent is not None):
             parser.error('--share-gpu and --compute-percent must be supplied together.')
         command = args.command[1:] if args.command[:1] == ['--'] else args.command
@@ -553,10 +681,28 @@ def main():
             parser.error('Supply an existing --cwd and a command after --.')
         with db:
             db.execute('BEGIN IMMEDIATE')
-            cur = db.execute('INSERT INTO jobs(project,command,cwd,vram,seconds,limit_seconds,submitted,queue_order,share_gpu,compute_percent) VALUES (?,?,?,?,?,?,?,?,?,?)',
+            validate_dependencies(db,args.after)
+            cur = db.execute('INSERT INTO jobs(project,command,cwd,vram,seconds,limit_seconds,submitted,queue_order,share_gpu,compute_percent,requester,depends_on) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
                 (args.project, json.dumps(command), str(args.cwd.resolve()), args.vram_gb,
-                 args.minutes*60, args.max_minutes*60 if args.max_minutes else None, time.time(), next_order(db), int(args.share_gpu), args.compute_percent if args.share_gpu else 100))
+                 args.minutes*60, args.max_minutes*60 if args.max_minutes else None, time.time(), next_order(db), int(args.share_gpu), args.compute_percent if args.share_gpu else 100,owner,json.dumps(args.after)))
         print(cur.lastrowid)
+    elif args.action == 'retry':
+        print(json.dumps(retry(db,args.id,retry_key=args.retry_key,mode='checkpoint' if args.from_checkpoint else 'start',
+            command=json.loads(args.command_json) if args.command_json is not None else None,cwd=args.cwd,
+            vram_gb=args.vram_gb,minutes=args.minutes,max_minutes=args.max_minutes,depends_on=args.after,exclusive=args.exclusive)))
+    elif args.action == 'notifications':
+        if not math.isfinite(args.wait) or not 0 <= args.wait <= 30 or args.after < 0:
+            parser.error('wait must be 0–30 seconds; after must be nonnegative')
+        deadline = time.monotonic() + args.wait
+        while True:
+            gpu_failures.reconcile(db,STATE)
+            notices = gpu_failures.inbox(db,args.requester,include_acked=args.include_acked,after=args.after)
+            if notices or time.monotonic() >= deadline:
+                print(json.dumps(dict(requester=args.requester,notifications=notices)))
+                break
+            time.sleep(min(.5,max(0,deadline-time.monotonic())))
+    elif args.action == 'acknowledge':
+        print(json.dumps(gpu_failures.acknowledge(db,args.requester,args.id)))
     elif args.action == 'reorder':
         print(json.dumps(dict(queued_job_ids=reorder(db, args.job_ids, args.expected_order))))
     elif args.action in ('pause', 'resume'):
@@ -606,9 +752,11 @@ def main():
         import gpu_monitor
         gpu_monitor.display(gpu_monitor.latest(STATE, db, gpu))
     else:
+        gpu_failures.reconcile(db,STATE)
         row = db.execute('SELECT * FROM jobs WHERE id=?', (args.id,)).fetchone()
         if not row:
             parser.error('Unknown job ID.')
+        gpu_failures.record(db,STATE,args.id)
         if args.action == 'cancel':
             db.execute("UPDATE jobs SET cancel=1, status=CASE WHEN status IN ('queued','paused') THEN 'cancelled' ELSE status END WHERE id=? AND status IN ('queued','running','paused')", (args.id,))
             db.commit()
@@ -617,10 +765,11 @@ def main():
             while row['status'] in ('queued', 'running'):
                 time.sleep(1)
                 row = db.execute('SELECT * FROM jobs WHERE id=?', (args.id,)).fetchone()
-            print(json.dumps(dict(row), indent=2))
+            gpu_failures.record(db,STATE,args.id)
+            print(json.dumps(job_report(db,row), indent=2))
             return 0 if row['status'] == 'completed' else 1
         else:
-            data = with_progress(row)
+            data = job_report(db,row)
             data.update(runtime_difference_seconds=row['elapsed']-row['seconds'],
                         estimated_vram_difference_gb=row['peak']-row['vram'],
                         artifacts=str(STATE / 'jobs' / str(args.id)),

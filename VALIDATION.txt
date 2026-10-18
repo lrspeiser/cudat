@@ -1,9 +1,15 @@
-Release candidate 0.3.0 — 18 October 2026
+Release candidate 0.4.0 — 18 October 2026
 
 Verified:
+- Durable requester inbox, bounded evidence, heuristic diagnosis, acknowledgements and replay safety.
+- Actual MCP stdio failure push -> requester fetch -> acknowledgement acceptance test.
+- Linked checkpoint retry completes without changing the failed parent or its evidence.
+- Concurrent duplicate retry keys create one job; mismatched options/active duplicates are rejected.
+- Failed prerequisites block only dependents; checkpoint-resume dependency lineage is followed.
+- Read-only dashboard failure endpoint preserves stored evidence.
 - Shared CPU fixtures overlap; exclusive fixtures serialize; one cancellation preserves the other job.
 - Shared admission checks consent, declared compute/VRAM, recent utilization, cushions and slot limits.
-- 30 unittest tests on Windows Python 3.13 and Ubuntu 24.04 under WSL.
+- 39 unittest tests on Windows Python 3.13 and Ubuntu 24.04 under WSL.
 - CPU-only process lifecycle: ordered queue, failure propagation, queued/running cancel,
   descendant cleanup, hard timeout, impossible budgets and duplicate workers.
 - Windows abrupt worker death recovery; Linux process-group cleanup.

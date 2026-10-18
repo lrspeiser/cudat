@@ -152,6 +152,22 @@ Workloads can report real steps, phases, GPU memory, and estimated time remainin
 
 See [operations and cleanup limits](docs/operations.md) for worker recovery, Windows/WSL boundaries, and troubleshooting. This is a cooperative local scheduler, not a sandbox or a multi-user cluster manager.
 
+## Failure handling and linked retries
+
+Give submissions a stable `--requester` agent/session ID (or set
+`GPU_QUEUE_REQUESTER`). A failed attempt produces a durable notice with bounded
+logs, an evidence-based heuristic diagnosis, last progress and checkpoint details.
+The dashboard offers a Diagnosis view. Requester-bound MCP connections push failure
+metadata; CLI clients use `notifications --requester ID --wait 30` or `wait JOB_ID`.
+Acknowledge a notice after handling it so it does not remain unread.
+
+After repairing the job, explicitly use `retry ID --from-checkpoint --retry-key KEY`
+or `--from-start`. The new attempt is linked to its parent; stable keys prevent
+duplicate reposts. Nothing automatically retries a failed workload. Declare
+prerequisites with repeated `submit --after ID` flags so their failure blocks only
+dependent work. See [the failure-handling contract](docs/failures.md) for client
+setup, commands, diagnosis limits, recovery and dependency rules.
+
 ## Development
 
 ```sh

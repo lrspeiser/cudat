@@ -59,6 +59,25 @@ class Reporter:
                     raise ValueError('Pause control requires a running job')
                 return bool(db.execute('SELECT pause_requested FROM jobs WHERE id=?', (self.job_id,)).fetchone()[0])
 
+    def checkpoint(self, *, checkpoint, resume_command):
+        """Register an already-saved recovery point without pausing the job."""
+        if not self.enabled:
+            return None
+        path = Path(checkpoint).expanduser().resolve()
+        if not path.exists():
+            raise ValueError('Save a durable checkpoint before registering it')
+        if (not isinstance(resume_command, list) or not resume_command or
+                any(not isinstance(v, str) or '\x00' in v for v in resume_command) or
+                not Path(resume_command[0]).is_absolute() or not Path(resume_command[0]).is_file()):
+            raise ValueError('resume_command must be an argument array with an absolute executable path')
+        with closing(sqlite3.connect(self.state_dir / 'queue.sqlite3', timeout=5)) as db:
+            with db:
+                changed = db.execute("UPDATE jobs SET checkpoint=?,resume_command=? WHERE id=? AND status='running'",
+                    (str(path), json.dumps(resume_command), self.job_id)).rowcount
+                if not changed:
+                    raise ValueError('Checkpoint registration requires a running job')
+        return dict(checkpoint=str(path), resume_command_registered=True)
+
     def pause(self, *, checkpoint, resume_command):
         """Register an already-saved checkpoint and exit 75. Cleanup in finally."""
         if not self.enabled:

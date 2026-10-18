@@ -68,3 +68,19 @@ Queued-job order changes are committed transactionally and recorded in queue_eve
 with old/new IDs. The worker rechecks the queue head after querying telemetry to
 avoid admitting a job which was concurrently moved or held. Paused checkpoints
 retain their original history; an explicit resume creates a linked new record.
+
+
+## Failure recovery and notification consumers
+
+Failure cleanup releases the managed slot before a notification is recorded.
+Inbox receipts are durable SQLite rows; failures missing a receipt are reconciled
+by the worker or by notification/report clients. Ordinary job failures do not stop
+unrelated queue work. Explicit prerequisite failures mark dependents blocked.
+Register requester IDs before submitting; legacy jobs fall back to project inboxes.
+See docs/failures.md for delivery, acknowledgements, diagnoses and linked retries.
+
+A running pre-0.4 worker does not generate these notices itself. New notification
+clients can reconcile its terminal records while it runs. Upgrade the worker only
+after active jobs finish or complete an operator-requested checkpoint pause. Do not
+kill a job merely to install notification support. Reconciliation can backfill old
+failed/rejected/interrupted/blocked/timed-out jobs without rerunning their commands.

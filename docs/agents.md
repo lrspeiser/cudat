@@ -25,7 +25,7 @@ The stdio adapter offers structured access for clients supporting the implemente
 gpu-queue-mcp
 ```
 
-By default, only read tools are exposed. To allow job submission, cancellation, reordering and cooperative pause/resume through an appropriately trusted local client:
+By default, read tools and notification acknowledgement are exposed. To allow job submission, cancellation, reordering and cooperative pause/resume through an appropriately trusted local client:
 
 ```sh
 gpu-queue-mcp --allow-submit
@@ -37,7 +37,10 @@ gpu-queue-mcp --allow-submit
 | --- | --- | --- |
 | `gpu_queue_status` | None | Read queue state. |
 | `gpu_queue_report` | `job_id` integer | Read one job's details. |
-| `gpu_queue_submit` | `project`, `vram_gb`, `minutes`, `cwd`, `command` string array; optional `max_minutes`, paired `share_gpu=true`/`compute_percent` | Submit once; requires `--allow-submit`. |
+| `gpu_queue_notifications` | Optional requester, wait_seconds, include_acked | Read this requester's failure packets. |
+| `gpu_queue_acknowledge` | notification_id, optional requester | Mark a failure notice handled; retain evidence. |
+| `gpu_queue_retry` | job_id, retry_key, mode, optional overrides | Explicit linked retry; requires --allow-submit. |
+| `gpu_queue_submit` | `project`, `vram_gb`, `minutes`, `cwd`, `command` string array; optional `requester`, `depends_on`; optional `max_minutes`, paired `share_gpu=true`/`compute_percent` | Submit once; requires `--allow-submit`. |
 | `gpu_queue_reorder` | `job_ids` array; optional `expected_order` | Reorder every waiting ID once; requires `--allow-submit`. |
 | `gpu_queue_pause` | `job_id` integer | Hold queued work or request checkpoint pause; requires `--allow-submit`. |
 | `gpu_queue_resume` | `job_id` integer | Queue a linked checkpoint resume or release a held job; requires `--allow-submit`. |
@@ -86,3 +89,10 @@ Before submitting, follow the [required checkpoint contract](pause-resume.md) an
 For parallel work, follow [the sharing contract](sharing.md). Both workloads must
 consent, and the single worker must have multiple slots enabled. Keep benchmark
 runs exclusive when shared contention would affect their validity.
+
+
+Bind a per-requester MCP connection with `--requester AGENT_SESSION_ID`, or pass
+requester on submissions/inbox calls. Use the same stable ID for delivery. MCP
+failure push uses standard logging; clients must fetch packets and acknowledge
+notification IDs, or long-poll the inbox if they do not consume logging. This does
+not guarantee waking an idle chat. See [failure delivery and retries](failures.md).

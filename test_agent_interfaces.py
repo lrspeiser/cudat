@@ -26,7 +26,7 @@ class AgentInterfaces(unittest.TestCase):
         lines = [json.loads(x) for x in result.stdout.splitlines()]
         self.assertEqual(len(lines), 2)
         self.assertEqual(lines[0]['result']['protocolVersion'], '2025-11-25')
-        self.assertEqual(len(lines[1]['result']['tools']), 2)
+        self.assertEqual(len(lines[1]['result']['tools']), 4)
 
     def test_mcp_validates_and_hides_write_tools(self):
         server = Server()

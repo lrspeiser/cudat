@@ -90,7 +90,7 @@ cumulative lifetime limit. Monitor total cost across the linked records yourself
 Pausing a job that has not started simply holds it (`paused` with no checkpoint).
 Resuming that held job queues the same ID at the end. A legacy running job without
 registered support rejects pause. There is no forced suspension or unsafe
-cancel-and-restart fallback. A completed/failed/cancelled job cannot be resumed.
+cancel-and-restart fallback. A completed/failed/cancelled job cannot be resumed with resume. A failed attempt can instead use an explicit linked `retry --from-checkpoint` after validating its registered checkpoint; see [failure handling](failures.md).
 
 ## Acceptance test before submission
 

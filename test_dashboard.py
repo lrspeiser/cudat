@@ -131,6 +131,20 @@ class DashboardTests(unittest.TestCase):
         with self.assertRaises(OSError):
             dashboard.serve(self.state, self.server.server_port)
 
+    def test_failure_packet_is_read_only_and_available_to_log_view(self):
+        self.fixture()
+        packet=dict(type='job_failure',job_id=3,requester='codex:test',diagnosis=dict(category='unknown'),log_excerpt='traceback evidence')
+        with closing(sqlite3.connect(self.state/'queue.sqlite3')) as db:
+            db.execute('CREATE TABLE failure_notifications(id INTEGER PRIMARY KEY, job_id INTEGER,packet TEXT)')
+            db.execute('INSERT INTO failure_notifications VALUES (1,3,?)',(json.dumps(packet),))
+            db.commit()
+        before=(self.state/'queue.sqlite3').read_bytes()
+        code,_,body=self.request('/api/jobs/3/failure')
+        self.assertEqual(code,200)
+        self.assertEqual(json.loads(body)['log_excerpt'],'traceback evidence')
+        self.assertEqual(self.request('/api/jobs/999/failure')[0],404)
+        self.assertEqual(before,(self.state/'queue.sqlite3').read_bytes())
+
 
 if __name__ == '__main__':
     unittest.main()

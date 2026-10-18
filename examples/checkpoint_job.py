@@ -43,6 +43,7 @@ def main():
                 stream.flush()
                 os.fsync(stream.fileno())
             temporary.replace(checkpoint)
+            reporter.checkpoint(checkpoint=checkpoint, resume_command=resume_command)
             reporter.update(completed=index + 1, total=args.steps, phase='processing', unit='items')
             print(f"Completed {index + 1}/{args.steps}", flush=True)
             if reporter.pause_requested() and data['completed'] < args.steps:

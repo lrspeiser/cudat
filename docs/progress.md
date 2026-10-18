@@ -84,3 +84,12 @@ Reporting 100% does not mark the queue job successful. The process must still fi
 Workload authors must also implement [checkpoint/resume](pause-resume.md) and
 [intermediate result reviews](review-runs.md). Resource progress alone does not
 establish that continuing an experiment is worthwhile.
+
+
+After each durable checkpoint write, call
+`reporter.checkpoint(checkpoint=path, resume_command=[absolute_executable, ...])`
+to register a failure recovery point without pausing. The method is a no-op outside
+queue context. Semantic checkpoint validation is the workload's responsibility.
+On failure, the last progress and checkpoint registration are included in the
+[requester failure packet](failures.md). `pause()` still registers the checkpoint
+and exits 75 only when a pause was requested.
