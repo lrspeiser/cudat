@@ -1,0 +1,23 @@
+Release candidate 0.1.0 — 18 October 2026
+
+Verified:
+- 17 unittest tests on Windows Python 3.13 and Ubuntu 24.04 under WSL.
+- CPU-only process lifecycle: FIFO, failure propagation, queued/running cancel,
+  descendant cleanup, hard timeout, impossible budgets and duplicate workers.
+- Windows abrupt worker death recovery; Linux process-group cleanup.
+- Progress SDK validation, phase/rate ETA, revised forecasts, terminal rejection.
+- MCP stdio handshake, tool visibility, isolated submit/report/cancel.
+- Dashboard read-only HTTP routes, bounded logs, host restrictions, missing data.
+- Wheel built and installed in a clean Windows virtual environment.
+- Installed commands launch; queued child -> progress SDK -> final report passed.
+- Browser inspection of live queue, narrow layout and running-job log dialog.
+
+Limitations:
+- No end-to-end tests inside actual Codex, Claude Code or Gemini MCP clients.
+- No new CUDA workload was launched for testing; the existing production workload was preserved.
+- Windows Job Objects do not contain WSL-hosted GPU services.
+- Linux detached descendants and abrupt worker death require operator recovery;
+  restart is gated by --acknowledge-orphans for stale running records.
+- Exact mobile-device emulation and a native non-WSL Linux host were not tested.
+- No actual agent-client integration or PyPI publication is implied by these checks.
+

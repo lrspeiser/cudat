@@ -1,0 +1,1 @@
+See docs/agents.md and integrations/codex/AGENTS.md. Merge the snippet into your project instructions; do not overwrite existing instructions.

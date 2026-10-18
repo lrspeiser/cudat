@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-gpu-queue"
+version = "0.1.0"
+description = "A local NVIDIA GPU queue and dashboard for humans and coding agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = []
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+]
+
+[project.scripts]
+gpu-queue = "gpu_queue:main"
+gpu-queue-dashboard = "gpu_dashboard:main"
+gpu-queue-mcp = "gpu_mcp:main"
+gpu-queue-progress = "gpu_progress:main"
+
+[tool.setuptools]
+py-modules = ["gpu_queue", "gpu_monitor", "gpu_dashboard", "gpu_mcp", "gpu_progress"]
+packages = ["gpu_queue_assets"]
+
+[tool.setuptools.package-data]
+gpu_queue_assets = ["*.html", "*.css", "*.js", "*.ps1"]
