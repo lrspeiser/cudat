@@ -25,7 +25,7 @@ The stdio adapter offers structured access for clients supporting the implemente
 gpu-queue-mcp
 ```
 
-By default, only read tools are exposed. To allow job submission and cancellation through an appropriately trusted local client:
+By default, only read tools are exposed. To allow job submission, cancellation, reordering and cooperative pause/resume through an appropriately trusted local client:
 
 ```sh
 gpu-queue-mcp --allow-submit
@@ -38,6 +38,9 @@ gpu-queue-mcp --allow-submit
 | `gpu_queue_status` | None | Read queue state. |
 | `gpu_queue_report` | `job_id` integer | Read one job's details. |
 | `gpu_queue_submit` | `project`, `vram_gb`, `minutes`, `cwd`, `command` string array; optional `max_minutes` | Submit once; requires `--allow-submit`. |
+| `gpu_queue_reorder` | `job_ids` array; optional `expected_order` | Reorder every waiting ID once; requires `--allow-submit`. |
+| `gpu_queue_pause` | `job_id` integer | Hold queued work or request checkpoint pause; requires `--allow-submit`. |
+| `gpu_queue_resume` | `job_id` integer | Queue a linked checkpoint resume or release a held job; requires `--allow-submit`. |
 | `gpu_queue_cancel` | `job_id` integer | Request cancellation; requires `--allow-submit`. |
 
 The adapter implements the MCP `2025-11-25` initialization and tools workflow over stdio. Compatibility depends on client protocol support; client-specific configuration syntax can change. In your client's MCP server settings, configure these values:
@@ -74,3 +77,7 @@ Replace the paths and estimates for your workload. Give each array element one a
 > Submit the training script through our shared GPU queue using this project's Python environment. Estimate VRAM and runtime from the configuration, record the job ID, and report its status. If it waits, explain why without starting another copy. When it finishes, inspect the report and log before declaring success.
 
 See [operating notes](operations.md) for environment inheritance and process cleanup limits.
+
+
+Before submitting, follow the [required checkpoint contract](pause-resume.md) and
+[reporting/review contract](review-runs.md). The project snippets include both requirements.

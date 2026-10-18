@@ -25,9 +25,9 @@ class DashboardTests(unittest.TestCase):
         self.thread.join()
         self.temp.cleanup()
 
-    def request(self, path, headers=None, method='GET'):
+    def request(self, path, headers=None, method='GET', body=None):
         connection = http.client.HTTPConnection('127.0.0.1', self.server.server_port)
-        connection.request(method, path, headers=headers or {})
+        connection.request(method, path, headers=headers or {}, body=body)
         response = connection.getresponse()
         result = response.status, dict(response.getheaders()), response.read()
         connection.close()
@@ -35,8 +35,8 @@ class DashboardTests(unittest.TestCase):
 
     def fixture(self):
         with closing(sqlite3.connect(self.state / 'queue.sqlite3')) as db:
-            db.execute('CREATE TABLE jobs (id INTEGER PRIMARY KEY, status TEXT, project TEXT)')
-            db.executemany('INSERT INTO jobs VALUES (?,?,?)', [(1, 'running', '<script>'), (2, 'queued', 'waiting'), (3, 'completed', 'done')])
+            db.execute("CREATE TABLE jobs (id INTEGER PRIMARY KEY, status TEXT, project TEXT, detail TEXT DEFAULT '')")
+            db.executemany('INSERT INTO jobs (id,status,project) VALUES (?,?,?)', [(1, 'running', '<script>'), (2, 'queued', 'waiting'), (3, 'completed', 'done')])
             db.commit()
         folder = self.state / 'jobs' / '1'
         folder.mkdir(parents=True)
@@ -76,7 +76,43 @@ class DashboardTests(unittest.TestCase):
     def test_rebinding_cross_site_and_mutation_rejected(self):
         self.assertEqual(self.request('/api/status', {'Host': 'attacker.example'})[0], 403)
         self.assertEqual(self.request('/api/status', {'Sec-Fetch-Site': 'cross-site'})[0], 403)
-        self.assertEqual(self.request('/api/status', method='POST')[0], 501)
+        self.assertEqual(self.request('/api/status', method='POST')[0], 403)
+
+    def controls(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        self.server = dashboard.serve(self.state, 0, allow_control=True)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        data = json.loads(self.request('/api/status')[2])
+        return {'Origin': f'http://127.0.0.1:{self.server.server_port}', 'Content-Type': 'application/json',
+                'X-GPU-Queue-Token': data['control_token']}
+
+    def test_control_reorders_and_rejects_stale_queue(self):
+        self.fixture()
+        with closing(sqlite3.connect(self.state / 'queue.sqlite3')) as db:
+            db.execute("INSERT INTO jobs (id,status,project) VALUES (4,'queued','second')")
+            db.commit()
+        headers = self.controls()
+        body = json.dumps(dict(job_ids=[4, 2], expected_order=[2, 4]))
+        code, _, _ = self.request('/api/queue/order', headers, 'POST', body)
+        self.assertEqual(code, 200)
+        self.assertEqual([j['id'] for j in json.loads(self.request('/api/status')[2])['jobs'] if j['status']=='queued'], [4, 2])
+        self.assertEqual(self.request('/api/queue/order', headers, 'POST', body)[0], 409)
+        self.assertEqual(self.request('/api/jobs/1/pause', headers, 'POST', '{}')[0], 409)
+        self.assertEqual(self.request('/api/jobs/2/pause', headers, 'POST', '{}')[0], 200)
+        self.assertEqual(self.request('/api/jobs/2/resume', headers, 'POST', '{}')[0], 200)
+
+    def test_controls_require_origin_token_and_bounded_json(self):
+        self.fixture()
+        headers = self.controls()
+        body = json.dumps(dict(job_ids=[2], expected_order=[2]))
+        for key, value in [('Origin','http://attacker.example'), ('X-GPU-Queue-Token','wrong'), ('Origin','null')]:
+            changed = dict(headers, **{key:value})
+            self.assertEqual(self.request('/api/queue/order', changed, 'POST', body)[0], 403)
+        self.assertEqual(self.request('/api/queue/order', headers, 'POST', 'x'*16385)[0], 400)
+        self.assertEqual(self.request('/api/queue/order', headers, 'POST', '[]')[0], 409)
 
     def test_static_security_headers_and_no_remote_dependencies(self):
         code, headers, body = self.request('/')
@@ -90,6 +126,10 @@ class DashboardTests(unittest.TestCase):
     def test_corrupt_telemetry_is_unavailable(self):
         (self.state / 'gpu-live.json').write_text('{bad')
         self.assertIsNone(json.loads(self.request('/api/status')[2])['snapshot'])
+
+    def test_second_dashboard_cannot_share_the_same_port(self):
+        with self.assertRaises(OSError):
+            dashboard.serve(self.state, self.server.server_port)
 
 
 if __name__ == '__main__':

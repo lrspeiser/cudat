@@ -25,11 +25,14 @@ def default_state_dir():
 
 STATE = default_state_dir()
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+QUEUE_ORDER = 'COALESCE(queue_order,id),id'
+PAUSE_EXIT_CODE = 75
 
 
-def connect():
-    STATE.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(STATE / 'queue.sqlite3', timeout=30)
+def connect(state=None):
+    state = Path(state) if state is not None else STATE
+    state.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(state / 'queue.sqlite3', timeout=30)
     db.row_factory = sqlite3.Row
     db.execute('''CREATE TABLE IF NOT EXISTS jobs (
       id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, command TEXT, cwd TEXT,
@@ -37,8 +40,96 @@ def connect():
       submitted REAL, started REAL, ended REAL, pid INTEGER, cancel INTEGER DEFAULT 0,
       elapsed REAL DEFAULT 0, peak REAL DEFAULT 0, baseline REAL, returncode INTEGER,
       warnings TEXT DEFAULT '[]', detail TEXT DEFAULT '')''')
+    # Serialize migrations with submit/reorder/worker admission.
     db.commit()
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        columns = {r[1] for r in db.execute('PRAGMA table_info(jobs)')}
+        for name, kind in {'queue_order': 'INTEGER', 'pause_requested': 'INTEGER DEFAULT 0',
+                           'pause_supported': 'INTEGER DEFAULT 0', 'checkpoint': 'TEXT',
+                           'resume_command': 'TEXT', 'resumed_from': 'INTEGER',
+                           'resumed_as': 'INTEGER'}.items():
+            if name not in columns:
+                db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {kind}')
+        db.execute('CREATE TABLE IF NOT EXISTS queue_events (time REAL, action TEXT, data TEXT)')
     return db
+
+
+def queued_ids(db):
+    return [r[0] for r in db.execute(f"SELECT id FROM jobs WHERE status='queued' ORDER BY {QUEUE_ORDER}")]
+
+
+def event(db, action, **data):
+    db.execute('INSERT INTO queue_events VALUES (?,?,?)', (time.time(), action, json.dumps(data)))
+
+
+def next_order(db):
+    return db.execute('SELECT COALESCE(MAX(COALESCE(queue_order,id)),0)+1 FROM jobs').fetchone()[0]
+
+
+def reorder(db, job_ids, expected_order=None):
+    if not isinstance(job_ids, list) or any(type(j) is not int or j < 1 or j > 2**63-1 for j in job_ids):
+        raise ValueError('job_ids must be a list of positive job IDs.')
+    if expected_order is not None and (not isinstance(expected_order, list) or
+            any(type(j) is not int or not 1 <= j <= 2**63-1 for j in expected_order)):
+        raise ValueError('expected_order must be a list of positive job IDs.')
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        previous = queued_ids(db)
+        if expected_order is not None and previous != expected_order:
+            raise ValueError('Queue changed; refresh and retry. No jobs were reordered.')
+        if len(job_ids) != len(set(job_ids)) or set(job_ids) != set(previous):
+            raise ValueError('Include every currently queued job exactly once. Running/paused/finished jobs cannot be reordered.')
+        db.executemany('UPDATE jobs SET queue_order=? WHERE id=?', enumerate(job_ids, 1))
+        event(db, 'reorder', previous=previous, job_ids=job_ids)
+    return job_ids
+
+
+def claim_head(db, jid, **values):
+    """Recheck after telemetry: a concurrent reorder/cancel must win admission."""
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        ids = queued_ids(db)
+        if not ids or ids[0] != jid:
+            return False
+        db.execute('UPDATE jobs SET '+','.join(k+'=?' for k in values)+' WHERE id=?', [*values.values(), jid])
+    return True
+
+
+def pause(db, jid):
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT * FROM jobs WHERE id=?', (jid,)).fetchone()
+        if row is None or row['status'] not in ('queued', 'running'):
+            raise ValueError('Only queued or running jobs can be paused.')
+        if row['status'] == 'running' and not row['pause_supported']:
+            raise ValueError('This job has not enabled cooperative pause. It must implement checkpoints with the progress SDK; no process was suspended.')
+        if row['status'] == 'queued':
+            db.execute("UPDATE jobs SET status='paused', detail='Held before launch.' WHERE id=?", (jid,))
+        else:
+            db.execute('UPDATE jobs SET pause_requested=1 WHERE id=?', (jid,))
+        event(db, 'pause', job_id=jid)
+    return dict(job_id=jid, status='paused' if row['status'] == 'queued' else 'pause_requested')
+
+
+def resume(db, jid):
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT * FROM jobs WHERE id=?', (jid,)).fetchone()
+        if row is None or row['status'] != 'paused' or row['resumed_as']:
+            raise ValueError('Job must be paused and not already resumed.')
+        if row['checkpoint']:
+            if not Path(row['checkpoint']).exists() or not row['resume_command']:
+                raise ValueError('Saved checkpoint or resume command is unavailable.')
+            cur = db.execute('INSERT INTO jobs(project,command,cwd,vram,seconds,limit_seconds,submitted,queue_order,resumed_from) VALUES (?,?,?,?,?,?,?,?,?)',
+                (row['project'], row['resume_command'], row['cwd'], row['vram'], row['seconds'], row['limit_seconds'], time.time(), next_order(db), jid))
+            new_id = cur.lastrowid
+            db.execute('UPDATE jobs SET resumed_as=? WHERE id=?', (new_id, jid))
+        else:
+            new_id = jid
+            db.execute("UPDATE jobs SET status='queued',queue_order=?,detail='' WHERE id=?", (next_order(db), jid))
+        event(db, 'resume', job_id=jid, resumed_as=new_id)
+    return dict(job_id=new_id, resumed_from=jid if new_id != jid else None, status='queued')
 
 
 def with_progress(row):
@@ -72,7 +163,7 @@ def gpu(device):
 
 
 @contextlib.contextmanager
-def worker_lock():
+def worker_lock(wait=False):
     if os.name == 'nt':
         import msvcrt
     else:
@@ -84,13 +175,21 @@ def worker_lock():
             f.write(b'0')
             f.flush()
         f.seek(0)
-        try:
-            if os.name == 'nt':
-                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            raise RuntimeError('A worker is already running for this queue.')
+        announced = False
+        while True:
+            try:
+                if os.name == 'nt':
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if not wait:
+                    raise RuntimeError('A worker is already running for this queue.')
+                if not announced:
+                    print('Waiting for the existing worker to finish and release its lock.', flush=True)
+                    announced = True
+                time.sleep(2)
         try:
             yield
         finally:
@@ -229,6 +328,9 @@ def run_job(db, row, device, before, interval, heartbeat=None):
                 if code is not None and tree.active() == 0:
                     status = 'completed' if code == 0 else 'failed'
                     detail = 'Command exited with code ' + str(code)
+                    control = db.execute('SELECT pause_requested,checkpoint,resume_command FROM jobs WHERE id=?', (jid,)).fetchone()
+                    if code == PAUSE_EXIT_CODE and control['pause_requested'] and control['checkpoint'] and control['resume_command']:
+                        status, detail = 'paused', 'Checkpoint saved; process exited for cooperative pause.'
                     break
                 time.sleep(interval)
     except KeyboardInterrupt:
@@ -258,7 +360,7 @@ def run_job(db, row, device, before, interval, heartbeat=None):
 
 
 def worker(args, db):
-    with worker_lock():
+    with worker_lock(wait=args.wait_for_worker):
         (STATE / 'stop-requested').unlink(missing_ok=True)
         stale = db.execute("SELECT id FROM jobs WHERE status='running'").fetchall()
         if stale and os.name != 'nt' and not args.acknowledge_orphans:
@@ -271,7 +373,7 @@ def worker(args, db):
         gpu_monitor.start(STATE, args.gpu, connect, gpu)
         last_message = ''
         def heartbeat(state, detail):
-            payload = dict(time=time.time(), state=state, detail=detail, reserve_gb=args.reserve_gb)
+            payload = dict(time=time.time(), state=state, detail=detail, reserve_gb=args.reserve_gb, version='0.2.0', queue_order_supported=True)
             pending = STATE / 'worker.tmp'
             pending.write_text(json.dumps(payload), encoding='utf-8')
             pending.replace(STATE / 'worker.json')
@@ -280,7 +382,7 @@ def worker(args, db):
                 heartbeat('stopped', 'Stop requested.')
                 print('Worker stopped after finishing its current job.', flush=True)
                 return
-            row = db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY id LIMIT 1").fetchone()
+            row = db.execute(f"SELECT * FROM jobs WHERE status='queued' ORDER BY {QUEUE_ORDER} LIMIT 1").fetchone()
             if not row:
                 heartbeat('idle', 'No queued jobs.')
                 if args.once:
@@ -290,14 +392,13 @@ def worker(args, db):
             try:
                 available = gpu(args.gpu)
                 if row['vram'] + args.reserve_gb > available['total']:
-                    update(db, row['id'], status='rejected', ended=time.time(), detail='VRAM budget plus reserve exceeds device capacity.')
+                    claim_head(db, row['id'], status='rejected', ended=time.time(), detail='VRAM budget plus reserve exceeds device capacity.')
                     continue
                 if row['vram'] + args.reserve_gb > available['total'] - available['used']:
                     message = f"Job {row['id']} waiting for {row['vram'] + args.reserve_gb:.2f} GiB free."
                 else:
                     # Claim atomically so a simultaneous cancel cannot be overwritten.
-                    changed = db.execute("UPDATE jobs SET status='running' WHERE id=? AND status='queued'", (row['id'],)).rowcount
-                    db.commit()
+                    changed = claim_head(db, row['id'], status='running')
                     if changed:
                         heartbeat('running', f"Running job {row['id']}.")
                         run_job(db, row, args.gpu, available, args.poll, heartbeat)
@@ -336,6 +437,7 @@ def main():
     submit.add_argument('command', nargs=argparse.REMAINDER)
     work = commands.add_parser('worker')
     work.add_argument('--gpu', default='0')
+    work.add_argument('--wait-for-worker', action='store_true', help='Wait for the current worker to exit before taking over; never interrupts its job.')
     work.add_argument('--poll', type=positive, default=2)
     work.add_argument('--reserve-gb', type=positive, default=1)
     work.add_argument('--acknowledge-orphans', action='store_true', help='Confirm surviving processes from a previous worker have been checked and stopped (Linux).')
@@ -349,7 +451,10 @@ def main():
     watch.add_argument('--gpu', default='0')
     commands.add_parser('doctor')
     commands.add_parser('stop-worker', help='Finish the current job, then stop accepting jobs.')
-    for name in ('report', 'cancel', 'wait'):
+    order = commands.add_parser('reorder', help='Supply all currently queued IDs in desired execution order.')
+    order.add_argument('job_ids', type=int, nargs='+')
+    order.add_argument('--expected-order', type=int, nargs='*', help='Reject if the queue has changed since this snapshot.')
+    for name in ('report', 'cancel', 'wait', 'pause', 'resume'):
         p = commands.add_parser(name)
         p.add_argument('id', type=int)
     args = parser.parse_args()
@@ -359,11 +464,16 @@ def main():
         command = args.command[1:] if args.command[:1] == ['--'] else args.command
         if not command or not args.cwd.is_dir():
             parser.error('Supply an existing --cwd and a command after --.')
-        cur = db.execute('INSERT INTO jobs(project,command,cwd,vram,seconds,limit_seconds,submitted) VALUES (?,?,?,?,?,?,?)',
-            (args.project, json.dumps(command), str(args.cwd.resolve()), args.vram_gb,
-             args.minutes*60, args.max_minutes*60 if args.max_minutes else None, time.time()))
-        db.commit()
+        with db:
+            db.execute('BEGIN IMMEDIATE')
+            cur = db.execute('INSERT INTO jobs(project,command,cwd,vram,seconds,limit_seconds,submitted,queue_order) VALUES (?,?,?,?,?,?,?,?)',
+                (args.project, json.dumps(command), str(args.cwd.resolve()), args.vram_gb,
+                 args.minutes*60, args.max_minutes*60 if args.max_minutes else None, time.time(), next_order(db)))
         print(cur.lastrowid)
+    elif args.action == 'reorder':
+        print(json.dumps(dict(queued_job_ids=reorder(db, args.job_ids, args.expected_order))))
+    elif args.action in ('pause', 'resume'):
+        print(json.dumps((pause if args.action == 'pause' else resume)(db, args.id)))
     elif args.action == 'worker':
         def terminate(signum, frame):
             raise KeyboardInterrupt
@@ -397,10 +507,12 @@ def main():
         if args.json:
             import gpu_monitor
             print(json.dumps(dict(state_dir=str(STATE), worker_running=running,
+                queued_job_ids=queued_ids(db),
                 jobs=[with_progress(r) for r in db.execute('SELECT * FROM jobs ORDER BY id DESC LIMIT 50')],
                 gpu_snapshot=gpu_monitor.latest(STATE, db, gpu))))
             return 0
         print('Worker: running' if running else 'Worker: stopped (queued jobs will wait)')
+        print('Waiting order: ' + ', '.join(map(str, queued_ids(db))))
         print('ID   STATUS        PROJECT                  EST/ACT seconds   BUDGET/PEAK GiB')
         for r in db.execute('SELECT * FROM jobs ORDER BY id DESC LIMIT 50'):
             print(f"{r['id']:<4} {r['status']:<13} {r['project'][:24]:<24} {r['seconds']:>7.1f}/{r['elapsed']:<7.1f} {r['vram']:>6.2f}/{r['peak']:.2f}")
@@ -411,7 +523,7 @@ def main():
         if not row:
             parser.error('Unknown job ID.')
         if args.action == 'cancel':
-            db.execute("UPDATE jobs SET cancel=1, status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END WHERE id=? AND status IN ('queued','running')", (args.id,))
+            db.execute("UPDATE jobs SET cancel=1, status=CASE WHEN status IN ('queued','paused') THEN 'cancelled' ELSE status END WHERE id=? AND status IN ('queued','running','paused')", (args.id,))
             db.commit()
             print('Cancellation recorded. Running jobs stop at the next monitoring check.')
         elif args.action == 'wait':

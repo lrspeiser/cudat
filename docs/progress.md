@@ -79,3 +79,8 @@ Do not advance completed counts with wall-clock time or with the original `--min
 Reporting 100% does not mark the queue job successful. The process must still finish successfully; cleanup, validation, or output writing may remain. The queue's exit status is authoritative.
 
 `expected_vram_gb` is the workload's revised estimate. It does not change the scheduler's admitted reservation or enforce a memory limit. Use measured peaks and revised estimates to improve a later submission's `--vram-gb` value. Keep sampled whole-GPU deltas and self-reported framework memory labeled separately.
+
+
+Workload authors must also implement [checkpoint/resume](pause-resume.md) and
+[intermediate result reviews](review-runs.md). Resource progress alone does not
+establish that continuing an experiment is worthwhile.

@@ -1,13 +1,17 @@
-Release candidate 0.1.0 — 18 October 2026
+Release candidate 0.2.0 — 18 October 2026
 
 Verified:
-- 17 unittest tests on Windows Python 3.13 and Ubuntu 24.04 under WSL.
-- CPU-only process lifecycle: FIFO, failure propagation, queued/running cancel,
+- 26 unittest tests on Windows Python 3.13 and Ubuntu 24.04 under WSL.
+- CPU-only process lifecycle: ordered queue, failure propagation, queued/running cancel,
   descendant cleanup, hard timeout, impossible budgets and duplicate workers.
 - Windows abrupt worker death recovery; Linux process-group cleanup.
 - Progress SDK validation, phase/rate ETA, revised forecasts, terminal rejection.
-- MCP stdio handshake, tool visibility, isolated submit/report/cancel.
+- MCP stdio handshake, tool visibility, isolated submit/report/cancel/reorder/pause/resume.
 - Dashboard read-only HTTP routes, bounded logs, host restrictions, missing data.
+- Local control origin/token checks, stale-order rejection and hold/resume.
+- Checkpoint pause -> short job -> checkpoint resume with exact completed-item ledger.
+- Legacy schema migration, concurrent admission recheck and unsupported-pause rejection.
+- Graceful worker handover and rejection of a second dashboard on the same port.
 - Wheel built and installed in a clean Windows virtual environment.
 - Installed commands launch; queued child -> progress SDK -> final report passed.
 - Browser inspection of live queue, narrow layout and running-job log dialog.

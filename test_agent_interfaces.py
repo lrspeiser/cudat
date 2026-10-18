@@ -52,6 +52,25 @@ class AgentInterfaces(unittest.TestCase):
             self.assertFalse(server.call('gpu_queue_cancel', {'job_id': jid})['isError'])
             # No worker exists and this test never starts the command.
 
+    def test_mcp_order_hold_resume_and_id_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server = Server(tmp, allow_submit=True)
+            ids = []
+            for project in ('a', 'b'):
+                result = server.call('gpu_queue_submit', dict(project=project, vram_gb=1, minutes=1,
+                                    cwd=tmp, command=[sys.executable, '-c', 'pass']))
+                ids.append(json.loads(result['content'][0]['text'])['job_id'])
+            result = server.call('gpu_queue_reorder', dict(job_ids=ids[::-1], expected_order=ids))
+            self.assertFalse(result['isError'], result)
+            self.assertEqual(json.loads(result['content'][0]['text'])['queued_job_ids'], ids[::-1])
+            self.assertFalse(server.call('gpu_queue_pause', {'job_id':ids[0]})['isError'])
+            self.assertFalse(server.call('gpu_queue_resume', {'job_id':ids[0]})['isError'])
+            with self.assertRaises(InvalidParams):
+                Server().call('gpu_queue_reorder', {'job_ids':ids})
+            for invalid in ([True], ['2'], [0], [1.2]):
+                with self.assertRaises(InvalidParams):
+                    server.call('gpu_queue_reorder', {'job_ids':invalid})
+
     def test_progress_derived_eta_resets_on_phase_and_rejects_terminal(self):
         with tempfile.TemporaryDirectory() as tmp:
             with closing(sqlite3.connect(Path(tmp) / 'queue.sqlite3')) as db:

@@ -9,6 +9,14 @@ import sqlite3
 import time
 import uuid
 
+PAUSE_EXIT_CODE = 75
+
+
+class PauseRequested(SystemExit):
+    """Let this propagate after finally blocks clean up owned GPU resources."""
+    def __init__(self):
+        super().__init__(PAUSE_EXIT_CODE)
+
 
 def finite(name, value, maximum=None):
     if value is None:
@@ -39,6 +47,36 @@ class Reporter:
     def from_env(cls):
         job_id, state = os.environ.get('GPU_QUEUE_JOB_ID'), os.environ.get('GPU_QUEUE_STATE_DIR')
         return cls(int(job_id), state) if job_id and state else cls()
+
+    def pause_requested(self):
+        """Register cooperative support and poll at safe checkpoint boundaries."""
+        if not self.enabled:
+            return False
+        with closing(sqlite3.connect(self.state_dir / 'queue.sqlite3', timeout=5)) as db:
+            with db:
+                changed = db.execute("UPDATE jobs SET pause_supported=1 WHERE id=? AND status='running'", (self.job_id,)).rowcount
+                if not changed:
+                    raise ValueError('Pause control requires a running job')
+                return bool(db.execute('SELECT pause_requested FROM jobs WHERE id=?', (self.job_id,)).fetchone()[0])
+
+    def pause(self, *, checkpoint, resume_command):
+        """Register an already-saved checkpoint and exit 75. Cleanup in finally."""
+        if not self.enabled:
+            raise ValueError('Pause requires queue context')
+        path = Path(checkpoint).expanduser().resolve()
+        if not path.exists():
+            raise ValueError('Save a durable checkpoint before pausing')
+        if (not isinstance(resume_command, list) or not resume_command or
+                any(not isinstance(v, str) or '\x00' in v for v in resume_command) or
+                not Path(resume_command[0]).is_absolute() or not Path(resume_command[0]).is_file()):
+            raise ValueError('resume_command must be an argument array with an absolute executable path')
+        with closing(sqlite3.connect(self.state_dir / 'queue.sqlite3', timeout=5)) as db:
+            with db:
+                changed = db.execute("UPDATE jobs SET checkpoint=?,resume_command=? WHERE id=? AND status='running' AND pause_requested=1 AND pause_supported=1",
+                    (str(path), json.dumps(resume_command), self.job_id)).rowcount
+                if not changed:
+                    raise ValueError('Pause must be requested before acknowledging it')
+        raise PauseRequested()
 
     def update(self, *, completed=None, total=None, phase='work', unit='items',
                eta_seconds=None, reported_vram_gb=None, expected_vram_gb=None,

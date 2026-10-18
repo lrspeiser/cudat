@@ -1,6 +1,6 @@
 # Cudat — Local GPU Queue
 
-A shared local NVIDIA GPU queue for people and coding agents. Submit commands from Codex, Claude Code, Gemini CLI, or a terminal; one worker runs them in order. See what is running, waiting, and finished in a local browser dashboard.
+A shared local NVIDIA GPU queue for people and coding agents. Submit commands from Codex, Claude Code, Gemini CLI, or a terminal; one worker runs them in submission order unless you reorder the waiting queue. See what is running, waiting, and finished in a local browser dashboard.
 
 Early release. Python 3.10+, NVIDIA drivers, and `nvidia-smi` on PATH are required to run GPU jobs. The core uses the Python standard library. No cloud account or model API key is required.
 
@@ -16,7 +16,7 @@ gpu-queue doctor
 gpu-queue worker
 ```
 
-Keep the worker terminal open. In another terminal, open the read-only dashboard:
+Keep the worker terminal open. In another terminal, open the dashboard (read-only by default):
 
 ```sh
 gpu-queue-dashboard
@@ -43,6 +43,9 @@ gpu-queue status
 gpu-queue report 1
 gpu-queue wait 1
 gpu-queue cancel 1
+gpu-queue pause 1
+gpu-queue resume 1
+gpu-queue reorder 3 2 4
 gpu-queue stop-worker
 ```
 
@@ -86,7 +89,42 @@ All snippets use the same queue and command contract. No agent-specific runtime 
 - `--max-minutes` optionally enforces a runtime limit.
 - Memory deltas compare whole-GPU usage to the pre-job baseline. They are estimates affected by outside applications, not exact per-process accounting.
 
-The worker runs one managed job at a time in FIFO order. It does not reserve the GPU against unrelated applications, preempt outside processes, or pack multiple jobs together. A large first job can hold up smaller jobs. `CUDA_VISIBLE_DEVICES` is set for managed jobs; applications must honor it.
+The worker runs one managed job at a time in submission order by default; operators may reorder waiting jobs. It does not reserve the GPU against unrelated applications, preempt outside processes, or pack multiple jobs together. A large first job can hold up smaller jobs. `CUDA_VISIBLE_DEVICES` is set for managed jobs; applications must honor it.
+
+## Required checkpoint/resume and useful progress
+
+Every submitted workload must implement and test checkpoint/resume. A pause request
+lets the job save its state, clean up GPU resources, and yield its slot. Resuming a
+checkpoint creates a linked new job ID; it continues saved work. See the
+[mandatory checkpoint contract](docs/pause-resume.md) and runnable
+[reference job](examples/checkpoint_job.py). Existing uninstrumented jobs cannot be
+paused safely through this tool.
+
+Developers must also emit intermediate quality measurements and recommendations at
+agreed review points, so agents can judge whether continuing is worthwhile. Read
+[the run reporting and review guide](docs/review-runs.md), including phase changes
+that explain GPU dips, fixed stopping rules and structured review logs.
+
+## Reorder and pause controls
+
+`gpu-queue status --json` exposes `queued_job_ids` in execution order. Supply every
+waiting ID exactly once to reorder it, for example:
+
+```sh
+gpu-queue reorder 3 2 4 --expected-order 2 3 4
+```
+
+A changed queue rejects a stale edit atomically. New submissions append to the end.
+Running jobs are unaffected. To move jobs visually, start:
+
+```sh
+gpu-queue-dashboard --allow-control
+```
+
+The dashboard then offers Up/Down, Hold, cooperative Pause and Resume controls.
+They work only on localhost using same-origin requests and a control token. A
+checkpoint resume appends to the queue; move the returned ID up if you want it to
+run directly after a particular short job. There is no automatic preemption.
 
 ## Visibility and logs
 

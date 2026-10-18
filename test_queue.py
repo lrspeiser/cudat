@@ -50,7 +50,7 @@ class QueueTests(unittest.TestCase):
                 self.fail('Worker did not start job')
             snapshot = json.loads(cli('status', '--json'))
             self.assertFalse(snapshot['worker_running'])
-            self.assertEqual(Path(snapshot['state_dir']), Path(tmp))
+            self.assertEqual(Path(snapshot['state_dir']).resolve(), Path(tmp).resolve())
             a = submit('import time; print("first"); time.sleep(.3)')
             b = submit('import sys; sys.exit(7)')
             c = submit('print("cancelled-before-start")')

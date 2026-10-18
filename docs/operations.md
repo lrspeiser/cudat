@@ -36,7 +36,7 @@ On Linux, stale running jobs block worker restart until you explicitly acknowled
 
 ## Dashboard
 
-`gpu-queue-dashboard --port 8765` starts a read-only local HTTP view. It does not launch work or cancel jobs. Keep it bound to loopback and use the CLI for control. The dashboard is intended for your local account; it has no multi-user authentication or internet deployment configuration.
+`gpu-queue-dashboard --port 8765` starts a read-only local HTTP view. It does not launch work or cancel jobs. Keep it bound to loopback and use the CLI for control. With `--allow-control`, it can reorder waiting jobs and request cooperative pause/resume. It has no arbitrary-command launch endpoint. Controls require a same-origin localhost request and token. The dashboard is intended for your local account; it has no multi-user authentication or internet deployment configuration.
 
 ## Troubleshooting
 
@@ -51,3 +51,20 @@ On Linux, stale running jobs block worker restart until you explicitly acknowled
 | Dashboard port is occupied | Choose another `--port`, then visit that localhost port. |
 
 To upgrade, finish or cancel managed jobs, stop the worker, back up state, install the new version, then restart. Do not replace a live worker's source or experiment on a production queue.
+
+
+## Upgrade a worker without interrupting its current job
+
+Queue ordering and cooperative pause require a 0.2+ worker. Back up state, then use
+the old CLI's `stop-worker` command to request it finish its current job and exit.
+Start the new worker against that SAME state directory with `worker --wait-for-worker`.
+It waits for the original lock, then takes over after the current job finishes.
+Do not kill the old worker or overwrite the source it is executing. Legacy clients
+still submit compatible records, but upgrade them to expose the new commands.
+A 0.1 worker ignores saved custom ordering until this handover completes.
+The schema migration preserves old IDs, commands and results.
+
+Queued-job order changes are committed transactionally and recorded in queue_events
+with old/new IDs. The worker rechecks the queue head after querying telemetry to
+avoid admitting a job which was concurrently moved or held. Paused checkpoints
+retain their original history; an explicit resume creates a linked new record.
