@@ -89,7 +89,7 @@ All snippets use the same queue and command contract. No agent-specific runtime 
 - `--max-minutes` optionally enforces a runtime limit.
 - Memory deltas compare whole-GPU usage to the pre-job baseline. They are estimates affected by outside applications, not exact per-process accounting.
 
-The worker runs one managed job at a time in submission order by default; operators may reorder waiting jobs. It does not reserve the GPU against unrelated applications, preempt outside processes, or pack multiple jobs together. A large first job can hold up smaller jobs. `CUDA_VISIBLE_DEVICES` is set for managed jobs; applications must honor it.
+By default, the worker runs one managed job at a time in submission order; operators may reorder waiting jobs. It does not reserve the GPU against unrelated applications or preempt outside processes. Optional shared slots can overlap consenting jobs, subject to declared compute/VRAM budgets and recent telemetry. A large first job can hold up smaller jobs. `CUDA_VISIBLE_DEVICES` is set for managed jobs; applications must honor it.
 
 ## Required checkpoint/resume and useful progress
 
@@ -125,6 +125,17 @@ The dashboard then offers Up/Down, Hold, cooperative Pause and Resume controls.
 They work only on localhost using same-origin requests and a control token. A
 checkpoint resume appends to the queue; move the returned ID up if you want it to
 run directly after a particular short job. There is no automatic preemption.
+
+## Optional parallel jobs
+
+Start the single shared worker with `--max-parallel 2`. Both jobs must opt into
+sharing using `submit --share-gpu --compute-percent PERCENT`, as well as their
+VRAM/runtime budgets. The worker checks declared reservations, actual free memory,
+and three recent utilization samples with a compute cushion. Ordinary jobs remain
+exclusive. See [sharing rules and examples](docs/sharing.md).
+
+These are cooperative estimates rather than hardware limits. Benchmark workloads
+may prefer exclusive execution; shared jobs can affect each other's speed.
 
 ## Visibility and logs
 

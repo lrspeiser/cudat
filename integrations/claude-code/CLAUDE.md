@@ -42,3 +42,15 @@ Checkpoint resume returns a new job ID; track it. `gpu-queue reorder 3 2 4` sets
 order of every currently waiting ID exactly once. Inspect `status --json` first and
 use `--expected-order` for stale-order protection. Only reprioritize jobs within the
 operator's authorization; running work is unaffected by queue reordering.
+
+
+## Optional shared slots
+
+Exclusive execution remains the default. Only for workloads authorized to share,
+submit with paired `--share-gpu --compute-percent PERCENT` plus the normal VRAM and
+time budgets. The single worker also needs `--max-parallel 2` (or the operator's
+chosen limit). All active jobs must consent; a utilization dip cannot override an
+exclusive reservation. Use measured pilot demand with cushions, and preserve
+checkpoint/resume. Keep timing-sensitive benchmarks exclusive. Report throughput
+changes and use workload-side memory measurements, since device deltas can include
+other co-running jobs. Read `docs/sharing.md` for admission details and limitations.

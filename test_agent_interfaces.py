@@ -37,18 +37,27 @@ class AgentInterfaces(unittest.TestCase):
                 validate(TOOLS[1], {'job_id': bad})
         with self.assertRaises(InvalidParams):
             validate(TOOLS[0], {'extra': 'value'})
+        with tempfile.TemporaryDirectory() as tmp:
+            submission = dict(project='shared',vram_gb=1,minutes=1,cwd=tmp,command=[sys.executable])
+            for options in (dict(share_gpu=True),dict(compute_percent=10),dict(share_gpu=1,compute_percent=10),dict(share_gpu=True,compute_percent=101)):
+                with self.assertRaises(InvalidParams):
+                    validate(TOOLS[2], dict(submission, **options))
+            validate(TOOLS[2], dict(submission, share_gpu=True, compute_percent=15))
 
     def test_mcp_submit_and_cancel_isolated_queue(self):
         with tempfile.TemporaryDirectory() as tmp:
             server = Server(tmp, allow_submit=True)
-            result = server.call('gpu_queue_submit', dict(project='test', vram_gb=1, minutes=1,
+            result = server.call('gpu_queue_submit', dict(project='test', vram_gb=1, minutes=1,share_gpu=True,compute_percent=15,
                                 cwd=tmp, command=[sys.executable, '-c', 'raise SystemExit(0)']))
             self.assertFalse(result['isError'], result)
             jid = json.loads(result['content'][0]['text'])['job_id']
             status = server.call('gpu_queue_status', {})
             self.assertFalse(status['isError'], status)
             report = server.call('gpu_queue_report', {'job_id': jid})
-            self.assertEqual(json.loads(report['content'][0]['text'])['status'], 'queued')
+            job = json.loads(report['content'][0]['text'])
+            self.assertEqual(job['status'], 'queued')
+            self.assertEqual(job['share_gpu'], 1)
+            self.assertEqual(job['compute_percent'], 15)
             self.assertFalse(server.call('gpu_queue_cancel', {'job_id': jid})['isError'])
             # No worker exists and this test never starts the command.
 

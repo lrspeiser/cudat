@@ -1,5 +1,6 @@
 """Local NVIDIA GPU command queue for Windows and Linux. Python standard library only."""
 import argparse
+from collections import deque
 import contextlib
 import ctypes
 from ctypes import wintypes as W
@@ -11,6 +12,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 
 ROOT = Path(__file__).resolve().parent
@@ -48,7 +50,8 @@ def connect(state=None):
         for name, kind in {'queue_order': 'INTEGER', 'pause_requested': 'INTEGER DEFAULT 0',
                            'pause_supported': 'INTEGER DEFAULT 0', 'checkpoint': 'TEXT',
                            'resume_command': 'TEXT', 'resumed_from': 'INTEGER',
-                           'resumed_as': 'INTEGER'}.items():
+                           'resumed_as': 'INTEGER', 'share_gpu': 'INTEGER DEFAULT 0',
+                           'compute_percent': 'REAL DEFAULT 100'}.items():
             if name not in columns:
                 db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {kind}')
         db.execute('CREATE TABLE IF NOT EXISTS queue_events (time REAL, action TEXT, data TEXT)')
@@ -121,8 +124,8 @@ def resume(db, jid):
         if row['checkpoint']:
             if not Path(row['checkpoint']).exists() or not row['resume_command']:
                 raise ValueError('Saved checkpoint or resume command is unavailable.')
-            cur = db.execute('INSERT INTO jobs(project,command,cwd,vram,seconds,limit_seconds,submitted,queue_order,resumed_from) VALUES (?,?,?,?,?,?,?,?,?)',
-                (row['project'], row['resume_command'], row['cwd'], row['vram'], row['seconds'], row['limit_seconds'], time.time(), next_order(db), jid))
+            cur = db.execute('INSERT INTO jobs(project,command,cwd,vram,seconds,limit_seconds,submitted,queue_order,resumed_from,share_gpu,compute_percent) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                (row['project'], row['resume_command'], row['cwd'], row['vram'], row['seconds'], row['limit_seconds'], time.time(), next_order(db), jid, row['share_gpu'], row['compute_percent']))
             new_id = cur.lastrowid
             db.execute('UPDATE jobs SET resumed_as=? WHERE id=?', (new_id, jid))
         else:
@@ -272,11 +275,11 @@ class PosixJobTree:
             self.proc = None
 
 
-def run_job(db, row, device, before, interval, heartbeat=None):
+def run_job(db, row, device, before, interval, heartbeat=None, stop_event=None):
     jid = row['id']
     folder = STATE / 'jobs' / str(jid)
     folder.mkdir(parents=True, exist_ok=True)
-    warnings = []
+    warnings = ['Shared GPU mode: memory deltas can include other jobs; use workload-reported VRAM.'] if row['share_gpu'] else []
     peak = 0.0
     started = time.monotonic()
     proc = None
@@ -288,6 +291,7 @@ def run_job(db, row, device, before, interval, heartbeat=None):
         with open(folder / 'output.log', 'wb') as out, open(folder / 'metrics.jsonl', 'a', encoding='utf-8') as metrics:
             env = os.environ.copy()
             env.update(CUDA_VISIBLE_DEVICES=before['uuid'], GPU_QUEUE_STATE_DIR=str(STATE.resolve()), GPU_QUEUE_JOB_ID=str(jid),
+                       GPU_QUEUE_SHARE_GPU=str(int(row['share_gpu'])), GPU_QUEUE_COMPUTE_PERCENT=str(row['compute_percent']),
                        GPU_QUEUE_VRAM_GB=str(row['vram']), GPU_QUEUE_EXPECTED_SECONDS=str(row['seconds']))
             # The launcher waits for GO before spawning user code, preventing a process-tree race.
             proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '_launch', row['command']],
@@ -302,6 +306,9 @@ def run_job(db, row, device, before, interval, heartbeat=None):
                 elapsed = time.monotonic() - started
                 if heartbeat:
                     heartbeat('running', f"Running job {jid}.")
+                if stop_event is not None and stop_event.is_set():
+                    status, detail = 'interrupted', 'Worker interrupted; this job process tree terminated.'
+                    break
                 cancelled = db.execute('SELECT cancel FROM jobs WHERE id=?', (jid,)).fetchone()[0]
                 if cancelled:
                     status, detail = 'cancelled', 'Cancelled by request.'
@@ -316,7 +323,7 @@ def run_job(db, row, device, before, interval, heartbeat=None):
                     metrics.write(json.dumps(dict(time=time.time(), elapsed=elapsed,
                         estimated_job_vram_gb=delta, **sample)) + '\n')
                     metrics.flush()
-                    if peak > row['vram'] and 'Estimated VRAM exceeded budget.' not in warnings:
+                    if not row['share_gpu'] and peak > row['vram'] and 'Estimated VRAM exceeded budget.' not in warnings:
                         warnings.append('Estimated VRAM exceeded budget.')
                 except Exception as exc:
                     if 'GPU monitoring interrupted; measurements may be incomplete.' not in warnings:
@@ -354,9 +361,32 @@ def run_job(db, row, device, before, interval, heartbeat=None):
         report = with_progress(db.execute('SELECT * FROM jobs WHERE id=?', (jid,)).fetchone())
         report['runtime_difference_seconds'] = elapsed - row['seconds']
         report['estimated_vram_difference_gb'] = peak - row['vram']
-        report['memory_measurement'] = 'Sampled whole-GPU usage minus pre-job baseline; other applications affect this estimate.'
+        report['memory_measurement'] = 'Sampled whole-GPU usage minus pre-job baseline; other applications and concurrent jobs affect this estimate. Not per-job allocation.'
         (folder / 'report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
         print(f'Job {jid}: {status}, {elapsed:.1f}s, estimated peak {peak:.2f} GiB', flush=True)
+
+
+def admission_reason(row, active, sample, reserve_gb, max_parallel, recent_utilization, baseline_gb, compute_reserve):
+    """Cooperative estimates + current telemetry, never a hardware partition."""
+    if len(active) >= max_parallel:
+        return 'Waiting for a worker slot.'
+    if active and (not row['share_gpu'] or any(not r['share_gpu'] for r in active)):
+        return 'Waiting for exclusive job(s) to finish; both jobs must opt into sharing.'
+    memory_free = sample['total'] - sample['used'] - reserve_gb
+    if active:
+        reserved_free = sample['total'] - baseline_gb - sum(r['vram'] for r in active) - reserve_gb
+        memory_free = min(memory_free, reserved_free)
+    if row['vram'] > memory_free:
+        return f"Waiting for {row['vram']:.2f} GiB of unreserved free VRAM (after cushion)."
+    if active:
+        declared = sum(r['compute_percent'] for r in active) + row['compute_percent']
+        if declared + compute_reserve > 100:
+            return 'Waiting for declared compute budgets to fit with the compute cushion.'
+        if len(recent_utilization) < 3:
+            return 'Collecting three recent GPU utilization samples before sharing.'
+        if max(recent_utilization) + row['compute_percent'] + compute_reserve > 100:
+            return 'Waiting for sustained measured GPU compute headroom.'
+    return None
 
 
 def worker(args, db):
@@ -372,50 +402,101 @@ def worker(args, db):
         import gpu_monitor
         gpu_monitor.start(STATE, args.gpu, connect, gpu)
         last_message = ''
+        running = {}
+        stop_event = threading.Event()
+        recent = deque(maxlen=3)
+        baseline = 0.0
         def heartbeat(state, detail):
-            payload = dict(time=time.time(), state=state, detail=detail, reserve_gb=args.reserve_gb, version='0.2.0', queue_order_supported=True)
+            payload = dict(time=time.time(), state=state, detail=detail, reserve_gb=args.reserve_gb,
+                version='0.3.0', queue_order_supported=True, sharing_supported=True,
+                max_parallel=args.max_parallel, compute_reserve_percent=args.compute_reserve_percent,
+                running_job_ids=list(running))
             pending = STATE / 'worker.tmp'
             pending.write_text(json.dumps(payload), encoding='utf-8')
             pending.replace(STATE / 'worker.json')
-        while True:
-            if (STATE / 'stop-requested').exists():
-                heartbeat('stopped', 'Stop requested.')
-                print('Worker stopped after finishing its current job.', flush=True)
-                return
-            row = db.execute(f"SELECT * FROM jobs WHERE status='queued' ORDER BY {QUEUE_ORDER} LIMIT 1").fetchone()
-            if not row:
-                heartbeat('idle', 'No queued jobs.')
-                if args.once:
+        def supervise(row, available):
+            with contextlib.closing(connect()) as job_db:
+                try:
+                    run_job(job_db, row, args.gpu, available, args.poll, stop_event=stop_event)
+                except Exception as exc:
+                    update(job_db, row['id'], status='failed', ended=time.time(), detail='Job supervisor failed: '+str(exc))
+
+        try:
+            while True:
+                for jid, thread in list(running.items()):
+                    if not thread.is_alive():
+                        thread.join()
+                        del running[jid]
+                        recent.clear()
+                        record = db.execute('SELECT status FROM jobs WHERE id=?', (jid,)).fetchone()
+                        if record and record[0] == 'running':
+                            update(db, jid, status='failed', ended=time.time(), detail='Job supervisor exited without recording a result.')
+                stopping = (STATE / 'stop-requested').exists()
+                if stopping and not running:
+                    heartbeat('stopped', 'Stop requested; all active jobs finished.')
+                    print('Worker stopped after finishing its current jobs.', flush=True)
                     return
+                row = None if stopping else db.execute(f"SELECT * FROM jobs WHERE status='queued' ORDER BY {QUEUE_ORDER} LIMIT 1").fetchone()
+                active = [dict(r) for r in db.execute("SELECT * FROM jobs WHERE status='running'")]
+                if row is None:
+                    recent.clear()
+                    heartbeat('running' if running else 'idle', 'Finishing active jobs.' if running else 'No queued jobs.')
+                    if args.once and not running:
+                        return
+                    time.sleep(args.poll)
+                    continue
+                try:
+                    available = gpu(args.gpu)
+                    recent.append(available['utilization'])
+                    if not running:
+                        baseline = available['used']
+                    if row['vram'] + args.reserve_gb > available['total']:
+                        claim_head(db, row['id'], status='rejected', ended=time.time(), detail='VRAM budget plus reserve exceeds device capacity.')
+                        continue
+                    message = admission_reason(row, active, available, args.reserve_gb,
+                        args.max_parallel, list(recent), baseline, args.compute_reserve_percent)
+                    if len(running) >= args.max_parallel:
+                        message = 'Waiting for a worker slot.'
+                    if message is None:
+                        if claim_head(db, row['id'], status='running'):
+                            thread = threading.Thread(target=supervise, args=(row, available), name=f"gpu-job-{row['id']}")
+                            running[row['id']] = thread
+                            thread.start()
+                            recent.clear()
+                            heartbeat('running', f"Running jobs {', '.join(map(str,running))}.")
+                        continue
+                except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+                    recent.clear()
+                    message = 'Waiting for GPU telemetry: ' + str(exc)
+                heartbeat('running' if running else 'waiting', message)
+                if message != last_message:
+                    print(message, flush=True)
+                    last_message = message
                 time.sleep(args.poll)
-                continue
-            try:
-                available = gpu(args.gpu)
-                if row['vram'] + args.reserve_gb > available['total']:
-                    claim_head(db, row['id'], status='rejected', ended=time.time(), detail='VRAM budget plus reserve exceeds device capacity.')
-                    continue
-                if row['vram'] + args.reserve_gb > available['total'] - available['used']:
-                    message = f"Job {row['id']} waiting for {row['vram'] + args.reserve_gb:.2f} GiB free."
-                else:
-                    # Claim atomically so a simultaneous cancel cannot be overwritten.
-                    changed = claim_head(db, row['id'], status='running')
-                    if changed:
-                        heartbeat('running', f"Running job {row['id']}.")
-                        run_job(db, row, args.gpu, available, args.poll, heartbeat)
-                    continue
-            except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
-                message = 'Waiting for GPU telemetry: ' + str(exc)
-            heartbeat('waiting', message)
-            if message != last_message:
-                print(message, flush=True)
-                last_message = message
-            time.sleep(args.poll)
+        finally:
+            stop_event.set()
+            for thread in running.values():
+                thread.join()
 
 
 def positive(value):
     number = float(value)
     if not math.isfinite(number) or number <= 0:
         raise argparse.ArgumentTypeError('Must be a finite number greater than zero.')
+    return number
+
+
+def percent(value):
+    number = positive(value)
+    if number > 100:
+        raise argparse.ArgumentTypeError('Percentage must be at most 100.')
+    return number
+
+
+def parallel_count(value):
+    number = int(value)
+    if not 1 <= number <= 8:
+        raise argparse.ArgumentTypeError('max-parallel must be between 1 and 8.')
     return number
 
 
@@ -433,6 +514,8 @@ def main():
     submit.add_argument('--vram-gb', type=positive, required=True, help='VRAM budget in GiB')
     submit.add_argument('--minutes', type=positive, required=True, help='Expected runtime')
     submit.add_argument('--max-minutes', type=positive, help='Optional enforced runtime limit')
+    submit.add_argument('--share-gpu', action='store_true', help='Allow overlap only with other consenting shared jobs.')
+    submit.add_argument('--compute-percent', type=percent, help='Required with --share-gpu: expected GPU compute demand (estimate, not a cap).')
     submit.add_argument('--cwd', type=Path, default=Path.cwd())
     submit.add_argument('command', nargs=argparse.REMAINDER)
     work = commands.add_parser('worker')
@@ -440,6 +523,8 @@ def main():
     work.add_argument('--wait-for-worker', action='store_true', help='Wait for the current worker to exit before taking over; never interrupts its job.')
     work.add_argument('--poll', type=positive, default=2)
     work.add_argument('--reserve-gb', type=positive, default=1)
+    work.add_argument('--max-parallel', type=parallel_count, default=1, help='Maximum simultaneous jobs; sharing still requires both jobs to opt in.')
+    work.add_argument('--compute-reserve-percent', type=percent, default=5, help='Measured/declared headroom cushion when overlapping jobs.')
     work.add_argument('--acknowledge-orphans', action='store_true', help='Confirm surviving processes from a previous worker have been checked and stopped (Linux).')
     work.add_argument('--once', action='store_true', help='Drain queue then exit; waits if head job cannot fit yet.')
     status_parser = commands.add_parser('status')
@@ -461,14 +546,16 @@ def main():
     STATE = args.state_dir.expanduser().resolve() if args.state_dir else default_state_dir()
     db = connect()
     if args.action == 'submit':
+        if args.share_gpu != (args.compute_percent is not None):
+            parser.error('--share-gpu and --compute-percent must be supplied together.')
         command = args.command[1:] if args.command[:1] == ['--'] else args.command
         if not command or not args.cwd.is_dir():
             parser.error('Supply an existing --cwd and a command after --.')
         with db:
             db.execute('BEGIN IMMEDIATE')
-            cur = db.execute('INSERT INTO jobs(project,command,cwd,vram,seconds,limit_seconds,submitted,queue_order) VALUES (?,?,?,?,?,?,?,?)',
+            cur = db.execute('INSERT INTO jobs(project,command,cwd,vram,seconds,limit_seconds,submitted,queue_order,share_gpu,compute_percent) VALUES (?,?,?,?,?,?,?,?,?,?)',
                 (args.project, json.dumps(command), str(args.cwd.resolve()), args.vram_gb,
-                 args.minutes*60, args.max_minutes*60 if args.max_minutes else None, time.time(), next_order(db)))
+                 args.minutes*60, args.max_minutes*60 if args.max_minutes else None, time.time(), next_order(db), int(args.share_gpu), args.compute_percent if args.share_gpu else 100))
         print(cur.lastrowid)
     elif args.action == 'reorder':
         print(json.dumps(dict(queued_job_ids=reorder(db, args.job_ids, args.expected_order))))

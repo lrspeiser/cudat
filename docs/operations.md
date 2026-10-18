@@ -18,7 +18,7 @@ Use an absolute executable from the project's environment and an explicit `--cwd
 
 ## Resource admission
 
-The worker checks NVIDIA telemetry before starting the first queued job. If the declared VRAM plus the configured reserve exceeds device capacity, it rejects the job. If it fits the device but not currently free memory, the job waits. Unavailable telemetry also causes waiting.
+The worker checks NVIDIA telemetry before starting the first queued job. With opt-in shared slots, it also checks consent, declared compute/VRAM reservations and recent utilization; see [sharing](sharing.md). If the declared VRAM plus the configured reserve exceeds device capacity, it rejects the job. If it fits the device but not currently free memory, the job waits. Unavailable telemetry also causes waiting.
 
 This is cooperative admission, not exclusive device ownership. An unrelated program can allocate memory after admission. Outside GPU utilization alone does not necessarily prevent admission. Memory measurements are sampled and may miss short peaks.
 
@@ -56,7 +56,7 @@ To upgrade, finish or cancel managed jobs, stop the worker, back up state, insta
 ## Upgrade a worker without interrupting its current job
 
 Queue ordering and cooperative pause require a 0.2+ worker. Back up state, then use
-the old CLI's `stop-worker` command to request it finish its current job and exit.
+the old CLI's `stop-worker` command to request it finish its current active jobs and exit.
 Start the new worker against that SAME state directory with `worker --wait-for-worker`.
 It waits for the original lock, then takes over after the current job finishes.
 Do not kill the old worker or overwrite the source it is executing. Legacy clients

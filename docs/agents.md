@@ -37,7 +37,7 @@ gpu-queue-mcp --allow-submit
 | --- | --- | --- |
 | `gpu_queue_status` | None | Read queue state. |
 | `gpu_queue_report` | `job_id` integer | Read one job's details. |
-| `gpu_queue_submit` | `project`, `vram_gb`, `minutes`, `cwd`, `command` string array; optional `max_minutes` | Submit once; requires `--allow-submit`. |
+| `gpu_queue_submit` | `project`, `vram_gb`, `minutes`, `cwd`, `command` string array; optional `max_minutes`, paired `share_gpu=true`/`compute_percent` | Submit once; requires `--allow-submit`. |
 | `gpu_queue_reorder` | `job_ids` array; optional `expected_order` | Reorder every waiting ID once; requires `--allow-submit`. |
 | `gpu_queue_pause` | `job_id` integer | Hold queued work or request checkpoint pause; requires `--allow-submit`. |
 | `gpu_queue_resume` | `job_id` integer | Queue a linked checkpoint resume or release a held job; requires `--allow-submit`. |
@@ -81,3 +81,8 @@ See [operating notes](operations.md) for environment inheritance and process cle
 
 Before submitting, follow the [required checkpoint contract](pause-resume.md) and
 [reporting/review contract](review-runs.md). The project snippets include both requirements.
+
+
+For parallel work, follow [the sharing contract](sharing.md). Both workloads must
+consent, and the single worker must have multiple slots enabled. Keep benchmark
+runs exclusive when shared contention would affect their validity.

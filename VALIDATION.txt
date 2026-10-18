@@ -1,7 +1,9 @@
-Release candidate 0.2.0 — 18 October 2026
+Release candidate 0.3.0 — 18 October 2026
 
 Verified:
-- 26 unittest tests on Windows Python 3.13 and Ubuntu 24.04 under WSL.
+- Shared CPU fixtures overlap; exclusive fixtures serialize; one cancellation preserves the other job.
+- Shared admission checks consent, declared compute/VRAM, recent utilization, cushions and slot limits.
+- 30 unittest tests on Windows Python 3.13 and Ubuntu 24.04 under WSL.
 - CPU-only process lifecycle: ordered queue, failure propagation, queued/running cancel,
   descendant cleanup, hard timeout, impossible budgets and duplicate workers.
 - Windows abrupt worker death recovery; Linux process-group cleanup.
