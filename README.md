@@ -46,6 +46,9 @@ gpu-queue cancel 1
 gpu-queue pause 1
 gpu-queue resume 1
 gpu-queue reorder 3 2 4
+gpu-queue archive 2 4
+gpu-queue status --include-archived
+gpu-queue restore 2 4
 gpu-queue stop-worker
 ```
 
@@ -121,10 +124,19 @@ Running jobs are unaffected. To move jobs visually, start:
 gpu-queue-dashboard --allow-control
 ```
 
-The dashboard then offers Up/Down, Hold, cooperative Pause and Resume controls.
+The dashboard then offers Up/Down, Hold, cooperative Pause, Resume, Archive and Restore controls.
 They work only on localhost using same-origin requests and a control token. A
 checkpoint resume appends to the queue; move the returned ID up if you want it to
 run directly after a particular short job. There is no automatic preemption.
+
+Archive hides finished jobs from the default CLI/dashboard history; it preserves
+IDs, logs, checkpoints, diagnoses, notifications, and all retry/resume/dependency
+links. Select **Show archived** to see them and **Restore** to make them visible
+again. `report ID` and direct log/diagnosis URLs keep working. Archiving does not
+acknowledge failure notices or free GPU memory. Active jobs and paused jobs that
+can still resume cannot be archived. An old pause record that already continued
+as another ID appears as **resumed → #ID** in history, rather than in Paused.
+See [history and archiving](docs/operations.md#history-and-archiving).
 
 ## Optional parallel jobs
 

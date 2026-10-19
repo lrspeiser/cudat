@@ -145,6 +145,36 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(self.request('/api/jobs/999/failure')[0],404)
         self.assertEqual(before,(self.state/'queue.sqlite3').read_bytes())
 
+    def test_archive_controls_preserve_direct_logs_and_failure_links(self):
+        self.fixture()
+        folder = self.state / 'jobs' / '3'
+        folder.mkdir(parents=True)
+        (folder / 'output.log').write_text('retained output')
+        headers = self.controls()
+        self.assertEqual(self.request('/api/jobs/1/archive', headers, 'POST', '{}')[0], 409)
+        self.assertEqual(self.request('/api/jobs/2/archive', headers, 'POST', '{}')[0], 409)
+        # Migrate before inserting a minimal failure packet.
+        self.assertEqual(self.request('/api/jobs/3/archive', headers, 'POST', '{}')[0], 200)
+        with closing(sqlite3.connect(self.state / 'queue.sqlite3')) as db:
+            db.execute('INSERT INTO failure_notifications(job_id,requester,packet) VALUES (3,?,?)',
+                       ('test', json.dumps(dict(job_id=3, log_excerpt='retained diagnosis'))))
+            db.commit()
+        visible = json.loads(self.request('/api/status')[2])
+        self.assertNotIn(3, [j['id'] for j in visible['jobs']])
+        self.assertEqual(visible['archived_count'], 1)
+        archived = json.loads(self.request('/api/status?include_archived=1')[2])
+        self.assertIn(3, [j['id'] for j in archived['jobs']])
+        self.assertEqual(json.loads(self.request('/api/jobs/3/log')[2])['text'], 'retained output')
+        self.assertEqual(json.loads(self.request('/api/jobs/3/failure')[2])['log_excerpt'], 'retained diagnosis')
+        # Direct links also survive the recent-history limit.
+        with closing(sqlite3.connect(self.state / 'queue.sqlite3')) as db:
+            db.executemany("INSERT INTO jobs(id,status,project) VALUES (?,'completed','old')", ((i,) for i in range(4, 110)))
+            db.commit()
+        self.assertEqual(self.request('/api/jobs/3/log')[0], 200)
+        self.assertEqual(self.request('/api/jobs/3/failure')[0], 200)
+        self.assertEqual(self.request('/api/jobs/3/restore', headers, 'POST', '{}')[0], 200)
+        self.assertEqual(json.loads(self.request('/api/status')[2])['archived_count'], 0)
+
 
 if __name__ == '__main__':
     unittest.main()

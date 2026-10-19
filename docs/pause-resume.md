@@ -87,6 +87,12 @@ record gets `resumed_as=NEW_ID`. It appends to the waiting queue. Original budge
 and optional hard runtime limit are reused **per resume attempt**, not as a
 cumulative lifetime limit. Monitor total cost across the linked records yourself.
 
+Once resumed, the original record is historical: CLI/dashboard label it
+`resumed → #NEW_ID` and show it in history, not Paused. JSON retains its raw
+`status="paused"` with `display_status="resumed"` and the successor link.
+It may be archived without removing its checkpoint, logs or lineage. A paused
+record without a successor is still resumable and cannot be archived.
+
 Pausing a job that has not started simply holds it (`paused` with no checkpoint).
 Resuming that held job queues the same ID at the end. A legacy running job without
 registered support rejects pause. There is no forced suspension or unsafe

@@ -36,7 +36,39 @@ On Linux, stale running jobs block worker restart until you explicitly acknowled
 
 ## Dashboard
 
-`gpu-queue-dashboard --port 8765` starts a read-only local HTTP view. It does not launch work or cancel jobs. Keep it bound to loopback and use the CLI for control. With `--allow-control`, it can reorder waiting jobs and request cooperative pause/resume. It has no arbitrary-command launch endpoint. Controls require a same-origin localhost request and token. The dashboard is intended for your local account; it has no multi-user authentication or internet deployment configuration.
+`gpu-queue-dashboard --port 8765` starts a read-only local HTTP view. It does not launch work or cancel jobs. Keep it bound to loopback and use the CLI for control. With `--allow-control`, it can reorder waiting jobs, request cooperative pause/resume, and archive/restore history. It has no arbitrary-command launch endpoint. Controls require a same-origin localhost request and token. The dashboard is intended for your local account; it has no multi-user authentication or internet deployment configuration.
+
+## History and archiving
+
+Use `gpu-queue archive ID [ID ...]` to hide finished history. `gpu-queue restore ID
+[ID ...]` makes it visible again without executing anything. A batch is atomic:
+an unknown ID or a running, queued, or still-resumable paused job rejects the
+whole archive request. Repeating an archive/restore is safe. Changes are recorded
+in `queue_events`; only the `archived_at` visibility timestamp changes.
+
+The dashboard hides archived jobs by default. **Show archived** includes them in
+the latest 100 finished records; with controls enabled, each eligible row has an
+**Archive** or **Restore** button. The CLI includes the latest 50 records and
+supports `status --include-archived` (also with `--json`). Both status APIs include
+`archived_count`. Retrieve any individual job using `report ID`, even outside the
+recent-history limit. `/api/jobs/ID/log` and `/api/jobs/ID/failure` continue working
+for archived and older jobs.
+
+Archiving never deletes logs, reports, checkpoints, failure packets or rows. IDs,
+retry/resume links, prerequisite checks and notification delivery remain intact.
+It does not acknowledge failure notices, cancel a job, reclaim disk space or free
+GPU memory. Inspect a failure and handle its requester notification separately.
+
+A pause record with `resumed_as=NEW_ID` is historical. It appears in finished
+history as **resumed → #NEW_ID** and may be archived. Only pauses without a
+successor appear in Paused. Machine-readable records retain `status="paused"`
+for scheduler compatibility and add `display_status="resumed"`; ordinary records
+use their existing status as `display_status`. Follow `resumed_as` to inspect the
+current continuation. The underlying state is preserved for dependency traversal.
+
+Version 0.4.1 clients migrate existing state in place, retaining all job IDs and
+artifacts. Back up the database before upgrading. The read-only dashboard also
+handles databases without the archive column without creating or migrating them.
 
 ## Troubleshooting
 

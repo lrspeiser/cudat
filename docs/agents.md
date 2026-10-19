@@ -35,7 +35,7 @@ gpu-queue-mcp --allow-submit
 
 | Tool | Arguments | Purpose |
 | --- | --- | --- |
-| `gpu_queue_status` | None | Read queue state. |
+| `gpu_queue_status` | Optional `include_archived` boolean | Read queue state; archived history hidden by default. |
 | `gpu_queue_report` | `job_id` integer | Read one job's details. |
 | `gpu_queue_notifications` | Optional requester, wait_seconds, include_acked | Read this requester's failure packets. |
 | `gpu_queue_acknowledge` | notification_id, optional requester | Mark a failure notice handled; retain evidence. |
@@ -45,6 +45,8 @@ gpu-queue-mcp --allow-submit
 | `gpu_queue_pause` | `job_id` integer | Hold queued work or request checkpoint pause; requires `--allow-submit`. |
 | `gpu_queue_resume` | `job_id` integer | Queue a linked checkpoint resume or release a held job; requires `--allow-submit`. |
 | `gpu_queue_cancel` | `job_id` integer | Request cancellation; requires `--allow-submit`. |
+| `gpu_queue_archive` | `job_ids` array | Hide finished history, retaining logs and links; requires `--allow-submit`. |
+| `gpu_queue_restore` | `job_ids` array | Show archived history without rerunning; requires `--allow-submit`. |
 
 The adapter implements the MCP `2025-11-25` initialization and tools workflow over stdio. Compatibility depends on client protocol support; client-specific configuration syntax can change. In your client's MCP server settings, configure these values:
 
@@ -96,3 +98,11 @@ requester on submissions/inbox calls. Use the same stable ID for delivery. MCP
 failure push uses standard logging; clients must fetch packets and acknowledge
 notification IDs, or long-poll the inbox if they do not consume logging. This does
 not guarantee waking an idle chat. See [failure delivery and retries](failures.md).
+
+Archive only finished history or pause records with a `resumed_as` successor.
+Never archive running, waiting, or still-resumable work. Archiving does not handle
+a failure notification: inspect, repair/retry or acknowledge it separately. Reports
+and direct logs remain accessible by ID, and linked retries/dependencies still
+work. Use `status --include-archived` or MCP `include_archived=true` when tracing
+older runs. For display, prefer `display_status` over raw `status`: a historical
+pause now reads `resumed`; follow its `resumed_as` link for the continuation.

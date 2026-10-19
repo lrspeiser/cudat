@@ -11,7 +11,7 @@ import secrets
 import socket
 import sqlite3
 import time
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 
 MAX_LOG_BYTES = 64 * 1024
@@ -44,7 +44,7 @@ def read_json(state, relative):
         return None
 
 
-def read_jobs(state):
+def read_jobs(state, include_archived=False):
     path = within(state, 'queue.sqlite3')
     if not path.is_file():
         return [], 'No queue database yet. Submit a job and start a worker.'
@@ -54,21 +54,38 @@ def read_jobs(state):
         db.execute('PRAGMA query_only=ON')
         columns = {r[1] for r in db.execute('PRAGMA table_info(jobs)')}
         order = 'COALESCE(queue_order,id),id' if 'queue_order' in columns else 'id'
-        rows = db.execute("SELECT * FROM jobs WHERE status='running' ORDER BY id").fetchall()
-        rows += db.execute(f"SELECT * FROM jobs WHERE status='queued' ORDER BY {order}").fetchall()
+        visible = ' AND archived_at IS NULL' if 'archived_at' in columns and not include_archived else ''
+        rows = db.execute(f"SELECT * FROM jobs WHERE status='running'{visible} ORDER BY id").fetchall()
+        rows += db.execute(f"SELECT * FROM jobs WHERE status='queued'{visible} ORDER BY {order}").fetchall()
         rows += db.execute("SELECT * FROM jobs WHERE status='paused' AND " +
-                           ('resumed_as IS NULL' if 'resumed_as' in columns else '1=1') + ' ORDER BY id').fetchall()
+                           ('resumed_as IS NULL' if 'resumed_as' in columns else '1=1') + visible + ' ORDER BY id').fetchall()
         finished = "status NOT IN ('queued','running','paused')"
         if 'resumed_as' in columns:
             finished += " OR (status='paused' AND resumed_as IS NOT NULL)"
-        rows += db.execute(f"SELECT * FROM jobs WHERE {finished} ORDER BY id DESC LIMIT 100").fetchall()
-        return [dict(row) for row in rows], None
+        rows += db.execute(f"SELECT * FROM jobs WHERE ({finished}){visible} ORDER BY id DESC LIMIT 100").fetchall()
+        from gpu_queue import display_status
+        return [dict(row, display_status=display_status(dict(row))) for row in rows], None
 
 
-def status(state):
+def read_job(state, jid):
+    """Direct ID access survives archiving and the recent-history display limit."""
+    if not 1 <= jid <= 2**63-1:
+        return None
+    path = within(state, 'queue.sqlite3')
+    if not path.is_file():
+        return None
+    with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=2)) as db:
+        db.row_factory = sqlite3.Row
+        db.execute('PRAGMA query_only=ON')
+        row = db.execute('SELECT * FROM jobs WHERE id=?', (jid,)).fetchone()
+        return dict(row) if row else None
+
+
+def status(state, include_archived=False):
     issues = []
+    archived_count = 0
     try:
-        jobs, issue = read_jobs(state)
+        jobs, issue = read_jobs(state, include_archived)
         if issue:
             issues.append(issue)
     except (sqlite3.Error, OSError, ValueError) as exc:
@@ -82,6 +99,9 @@ def status(state):
         path=within(state,'queue.sqlite3')
         if path.exists():
             with closing(sqlite3.connect(path.as_uri()+'?mode=ro',uri=True,timeout=2)) as db:
+                columns = {r[1] for r in db.execute('PRAGMA table_info(jobs)')}
+                if 'archived_at' in columns:
+                    archived_count = db.execute('SELECT COUNT(*) FROM jobs WHERE archived_at IS NOT NULL').fetchone()[0]
                 if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='failure_notifications'").fetchone():
                     for job in jobs:
                         notice=db.execute('SELECT id,packet FROM failure_notifications WHERE job_id=?',(job['id'],)).fetchone()
@@ -105,7 +125,7 @@ def status(state):
     except (OSError, ValueError):
         pass
     return dict(time=time.time(), jobs=jobs, snapshot=snapshot, worker=worker,
-                history=history, issues=issues, read_only=True)
+                history=history, issues=issues, read_only=True, archived_count=archived_count)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -149,7 +169,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == '/style.css':
             self.reply(200, CSS, 'text/css; charset=utf-8')
         elif path == '/api/status':
-            data = status(self.state)
+            include_archived = parse_qs(urlsplit(self.path).query).get('include_archived') == ['1']
+            data = status(self.state, include_archived)
             data.update(read_only=not self.allow_control, control_token=self.token if self.allow_control else None)
             pending = read_json(self.state, 'upgrade-pending.json')
             if pending and not (data.get('worker') or {}).get('queue_order_supported'):
@@ -158,9 +179,8 @@ class Handler(BaseHTTPRequestHandler):
         elif re.fullmatch(r'/api/jobs/[1-9][0-9]{0,18}/log', path):
             jid = int(path.split('/')[3])
             try:
-                jobs, _ = read_jobs(self.state)
-                if not any(job['id'] == jid for job in jobs):
-                    self.reply(404, {'error': 'Job unavailable in recent queue history'})
+                if read_job(self.state, jid) is None:
+                    self.reply(404, {'error': 'Unknown job'})
                     return
                 log, truncated = tail(within(self.state, f'jobs/{jid}/output.log'), MAX_LOG_BYTES)
                 self.reply(200, {'id': jid, 'text': log, 'truncated': truncated})
@@ -168,8 +188,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(404, {'error': 'Log not available'})
         elif re.fullmatch(r'/api/jobs/[1-9][0-9]{0,18}/failure', path):
             jid=int(path.split('/')[3])
-            data=status(self.state)
-            found=next((j.get('failure') for j in data['jobs'] if j['id']==jid),None)
+            found = None
+            try:
+                if read_job(self.state, jid):
+                    path = within(self.state, 'queue.sqlite3')
+                    with closing(sqlite3.connect(path.as_uri()+'?mode=ro', uri=True, timeout=2)) as db:
+                        notice = db.execute('SELECT id,packet FROM failure_notifications WHERE job_id=?', (jid,)).fetchone()
+                        if notice:
+                            found = dict(notification_id=notice[0], **json.loads(notice[1]))
+            except (OSError, ValueError, sqlite3.Error):
+                pass
             self.reply(200 if found else 404,found or {'error':'Failure packet not available'})
         else:
             self.reply(404, {'error': 'Not found'})
@@ -193,7 +221,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(data, dict):
                 raise ValueError('JSON object required')
             path = urlsplit(self.path).path
-            job_control = re.fullmatch(r'/api/jobs/([1-9][0-9]{0,18})/(pause|resume)', path)
+            job_control = re.fullmatch(r'/api/jobs/([1-9][0-9]{0,18})/(pause|resume|archive|restore)', path)
             if path != '/api/queue/order' and not job_control:
                 self.reply(404, {'error': 'Not found'})
                 return
@@ -211,7 +239,12 @@ class Handler(BaseHTTPRequestHandler):
                     if data:
                         raise ValueError('Job control takes an empty object')
                     jid, action = int(job_control[1]), job_control[2]
-                    result = (queue.pause if action == 'pause' else queue.resume)(db, jid)
+                    if not 1 <= jid <= 2**63-1:
+                        raise ValueError('Invalid job ID')
+                    if action in ('archive', 'restore'):
+                        result = queue.set_archived(db, [jid], archived=action == 'archive')
+                    else:
+                        result = (queue.pause if action == 'pause' else queue.resume)(db, jid)
             self.reply(200, result)
         except (ValueError, TypeError, sqlite3.Error) as exc:
             self.reply(409, {'error': str(exc)})
@@ -237,7 +270,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--state-dir', type=Path)
     parser.add_argument('--port', type=int, default=8765)
-    parser.add_argument('--allow-control', action='store_true', help='Enable local reorder and cooperative pause/resume controls.')
+    parser.add_argument('--allow-control', action='store_true', help='Enable local reorder, pause/resume and archive/restore controls.')
     args = parser.parse_args()
     if args.state_dir is None:
         import gpu_queue
@@ -262,7 +295,7 @@ HTML = '''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name=
 <section class="panel"><div class="section-head"><h2>Running now</h2><span class="muted">Runtime is an estimate, not a completion percentage</span></div><div id="running"></div></section>
 <section class="panel"><div class="section-head"><h2>Up next</h2><span class="muted">Move waiting jobs up or down. Running work finishes first.</span></div><div id="waiting"></div></section>
 <section class="panel"><div class="section-head"><h2>Paused</h2><span class="muted">Resume appends to the queue; move it up if needed</span></div><div id="paused"></div></section>
-<section class="panel"><div class="section-head"><h2>Recent history</h2><span class="muted">Latest 100 finished jobs</span></div><div id="history"></div></section>
+<section class="panel"><div class="section-head"><h2>Recent history</h2><label class="muted"><input id="show-archived" type="checkbox"> Show archived <span id="archived-count"></span></label></div><div id="history"></div></section>
 <section class="panel"><div class="section-head"><h2>Observed GPU processes</h2><span class="muted">Best-effort attribution</span></div><div id="processes"></div><p class="footnote" id="scope"></p></section>
 <footer>Memory deltas are sampled whole-GPU usage minus the pre-job baseline. Other applications affect this estimate. Pause is cooperative: the job saves its checkpoint and exits before releasing its slot. A pause request does not immediately free VRAM.</footer>
 <dialog id="logs"><div class="section-head"><h2 id="log-title">Job log</h2><button id="close-log">Close</button></div><p class="muted" id="log-note"></p><pre id="log-text"></pre></dialog>
@@ -285,11 +318,13 @@ function controls(j,i,rows,data){
  const disabled=controlBusy?' disabled':'';
  if(j.status==='queued')return '<button data-order="'+i+'" data-step="-1" aria-label="Move job '+j.id+' up"'+(i===0?' disabled':disabled)+'>Up</button> <button data-order="'+i+'" data-step="1" aria-label="Move job '+j.id+' down"'+(i===rows.length-1?' disabled':disabled)+'>Down</button> <button data-action="pause" data-job="'+j.id+'"'+disabled+'>Hold</button> ';
  if(j.status==='running')return j.pause_requested?'<span class="detail">Pause requested; waiting for checkpoint</span> ':j.pause_supported?'<button data-action="pause" data-job="'+j.id+'"'+disabled+'>Pause</button> ':'<span class="detail">Pause unavailable: job has not registered checkpoint support</span> ';
+ if(j.archived_at)return '<button data-action="restore" data-job="'+j.id+'"'+disabled+'>Restore</button> ';
  if(j.status==='paused'&&!j.resumed_as)return '<button data-action="resume" data-job="'+j.id+'"'+disabled+'>Resume</button> ';
+ if(!['queued','running','paused'].includes(j.status)||j.resumed_as)return '<button data-action="archive" data-job="'+j.id+'"'+disabled+'>Archive</button> ';
  return '';
 }
-function jobs(rows,kind,data){if(!rows.length)return '<div class="empty">'+({running:'No job currently marked running.',waiting:'The queue is clear.',history:'Completed jobs will appear here.',paused:'No paused jobs.'}[kind])+'</div>';return table(['Job / project','State','Runtime · actual / original estimate','VRAM · peak delta / budget',''],rows.map((j,i)=>{let detail=kind==='waiting'?reason(j,i,data):j.detail;let warnings=[];try{warnings=JSON.parse(j.warnings||'[]')}catch{};return '<tr><td><div class="project">#'+esc(j.id)+' · '+esc(j.project)+'</div><div class="detail">'+(j.retry_of?'Retry of #'+esc(j.retry_of)+' · ':'')+esc(j.requester||'Legacy project inbox')+'</div><div class="detail">'+(j.share_gpu?'Shared · declared compute '+number(j.compute_percent,0)+'%':'Exclusive')+'</div><div class="detail">'+esc(detail)+(warnings.length?'<br>'+esc(warnings.join(' ')):'')+'</div>'+progress(j,data)+'</td><td><span class="tag '+esc(j.status)+'">'+esc(j.status)+'</span></td><td>'+duration(j.elapsed)+' / '+duration(j.seconds)+'</td><td>'+number(j.peak)+' / '+number(j.vram)+' GiB</td><td>'+(j.failure?'<button data-failure="'+esc(j.id)+'">Diagnosis</button> ':'')+controls(j,i,rows,data)+'<button data-log="'+esc(j.id)+'">Log</button></td></tr>'}))}
-function render(data){latestData=data;$('mode').textContent=data.read_only?'Read only · localhost':'Queue controls · localhost';const s=data.snapshot,g=s?.gpu,age=s?Math.max(0,data.time-s.time):null,w=data.worker;$('connection').textContent='Updated '+date(data.time)+' · refreshes every 3s';$('device').textContent=g?.name||'No device sample';$('telemetry').textContent=age==null?'Start a worker to collect telemetry':`Sample ${duration(age)} old${age>30?' · STALE':''}`;$('util').textContent=g?number(g.utilization,0)+'%':'—';$('memory').textContent=g?number(g.used)+' GiB':'—';$('capacity').textContent=g?'of '+number(g.total)+' GiB capacity':'Whole device, GiB';let active=data.jobs.filter(j=>j.status==='running'),queued=data.jobs.filter(j=>j.status==='queued');$('queue-count').textContent=queued.length+' waiting';$('worker').textContent=w?`Worker: ${w.state||w.status||'unknown'} · ${active.length}/${w.max_parallel||1} slots${data.time-w.time>30?' · heartbeat stale':''}`:'Worker heartbeat unavailable';$('issues').innerHTML=[...data.issues,...(s?.issues||[])].map(x=>'<div class="notice">'+esc(x)+'</div>').join('');$('running').innerHTML=jobs(active,'running',data);$('waiting').innerHTML=jobs(queued,'waiting',data);$('paused').innerHTML=jobs(data.jobs.filter(j=>j.status==='paused'),'paused',data);$('history').innerHTML=jobs(data.jobs.filter(j=>!['running','queued','paused'].includes(j.status)),'history',data);const p=s?.processes||[];$('processes').innerHTML=p.length?table(['PID','Process','Busiest engine','Dedicated MiB','Ownership'],p.map(p=>'<tr><td>'+esc(p.pid)+'</td><td>'+esc(p.name)+'</td><td>'+number(p.engine_percent)+'%</td><td>'+number(p.dedicated_mib)+'</td><td>'+esc(p.owner)+'</td></tr>')):'<div class="empty">No process samples. This does not establish that the GPU is idle.</div>';$('scope').textContent=(s?.scope||'')+' Process memory may be shared or double-counted; do not sum rows. Unavailable measurements show —.';let h=data.history.filter(x=>Number.isFinite(x.time)&&Number.isFinite(x.gpu?.utilization));if(h.length>1){let lo=h[0].time,hi=h.at(-1).time;let pts=h.map(x=>`${((x.time-lo)/(hi-lo||1)*960).toFixed(1)},${(145-Math.min(100,Math.max(0,x.gpu.utilization))*1.35).toFixed(1)}`).join(' ');$('chart').innerHTML='<path d="M0 10H960 M0 77H960 M0 145H960" stroke="#2a3a42" fill="none"/><polyline points="'+pts+'" fill="none" stroke="#b3efce" stroke-width="2.5"/>';$('chart-start').textContent=date(lo);$('chart-end').textContent=date(hi)}else{$('chart').innerHTML='<text x="20" y="80">Waiting for telemetry history</text>'}}
+function jobs(rows,kind,data){if(!rows.length)return '<div class="empty">'+({running:'No job currently marked running.',waiting:'The queue is clear.',history:'No finished jobs in this view.',paused:'No paused jobs.'}[kind])+'</div>';return table(['Job / project','State','Runtime · actual / original estimate','VRAM · peak delta / budget',''],rows.map((j,i)=>{let detail=kind==='waiting'?reason(j,i,data):j.detail;let warnings=[];try{warnings=JSON.parse(j.warnings||'[]')}catch{};return '<tr><td><div class="project">#'+esc(j.id)+' · '+esc(j.project)+'</div><div class="detail">'+(j.retry_of?'Retry of #'+esc(j.retry_of)+' · ':'')+esc(j.requester||'Legacy project inbox')+(j.resumed_from?' · Resumed from #'+esc(j.resumed_from):'')+(j.resumed_as?' · Continued as #'+esc(j.resumed_as):'')+'</div><div class="detail">'+(j.share_gpu?'Shared · declared compute '+number(j.compute_percent,0)+'%':'Exclusive')+'</div><div class="detail">'+esc(detail)+(warnings.length?'<br>'+esc(warnings.join(' ')):'')+'</div>'+progress(j,data)+'</td><td><span class="tag '+esc(j.status)+'">'+esc(j.display_status||j.status)+(j.resumed_as?' → #'+esc(j.resumed_as):'')+'</span>'+(j.archived_at?' <span class="tag">Archived</span>':'')+'</td><td>'+duration(j.elapsed)+' / '+duration(j.seconds)+'</td><td>'+number(j.peak)+' / '+number(j.vram)+' GiB</td><td>'+(j.failure?'<button data-failure="'+esc(j.id)+'">Diagnosis</button> ':'')+controls(j,i,rows,data)+'<button data-log="'+esc(j.id)+'">Log</button></td></tr>'}))}
+function render(data){latestData=data;$('mode').textContent=data.read_only?'Read only · localhost':'Queue controls · localhost';const s=data.snapshot,g=s?.gpu,age=s?Math.max(0,data.time-s.time):null,w=data.worker;$('connection').textContent='Updated '+date(data.time)+' · refreshes every 3s';$('device').textContent=g?.name||'No device sample';$('telemetry').textContent=age==null?'Start a worker to collect telemetry':`Sample ${duration(age)} old${age>30?' · STALE':''}`;$('util').textContent=g?number(g.utilization,0)+'%':'—';$('memory').textContent=g?number(g.used)+' GiB':'—';$('capacity').textContent=g?'of '+number(g.total)+' GiB capacity':'Whole device, GiB';let active=data.jobs.filter(j=>j.status==='running'),queued=data.jobs.filter(j=>j.status==='queued');$('queue-count').textContent=queued.length+' waiting';$('worker').textContent=w?`Worker: ${w.state||w.status||'unknown'} · ${active.length}/${w.max_parallel||1} slots${data.time-w.time>30?' · heartbeat stale':''}`:'Worker heartbeat unavailable';$('issues').innerHTML=[...data.issues,...(s?.issues||[])].map(x=>'<div class="notice">'+esc(x)+'</div>').join('');$('running').innerHTML=jobs(active,'running',data);$('waiting').innerHTML=jobs(queued,'waiting',data);$('archived-count').textContent='('+data.archived_count+')';$('paused').innerHTML=jobs(data.jobs.filter(j=>j.status==='paused'&&!j.resumed_as),'paused',data);$('history').innerHTML=jobs(data.jobs.filter(j=>!['running','queued','paused'].includes(j.status)||j.resumed_as),'history',data);const p=s?.processes||[];$('processes').innerHTML=p.length?table(['PID','Process','Busiest engine','Dedicated MiB','Ownership'],p.map(p=>'<tr><td>'+esc(p.pid)+'</td><td>'+esc(p.name)+'</td><td>'+number(p.engine_percent)+'%</td><td>'+number(p.dedicated_mib)+'</td><td>'+esc(p.owner)+'</td></tr>')):'<div class="empty">No process samples. This does not establish that the GPU is idle.</div>';$('scope').textContent=(s?.scope||'')+' Process memory may be shared or double-counted; do not sum rows. Unavailable measurements show —.';let h=data.history.filter(x=>Number.isFinite(x.time)&&Number.isFinite(x.gpu?.utilization));if(h.length>1){let lo=h[0].time,hi=h.at(-1).time;let pts=h.map(x=>`${((x.time-lo)/(hi-lo||1)*960).toFixed(1)},${(145-Math.min(100,Math.max(0,x.gpu.utilization))*1.35).toFixed(1)}`).join(' ');$('chart').innerHTML='<path d="M0 10H960 M0 77H960 M0 145H960" stroke="#2a3a42" fill="none"/><polyline points="'+pts+'" fill="none" stroke="#b3efce" stroke-width="2.5"/>';$('chart-start').textContent=date(lo);$('chart-end').textContent=date(hi)}else{$('chart').innerHTML='<text x="20" y="80">Waiting for telemetry history</text>'}}
 document.addEventListener('click',async event=>{let b=event.target.closest('[data-log]');if(!b)return;$('log-title').textContent='Job #'+b.dataset.log+' · output';$('log-text').textContent='Loading…';$('log-note').textContent='';$('logs').showModal();try{let r=await fetch('/api/jobs/'+b.dataset.log+'/log');let d=await r.json();$('log-text').textContent=d.text||d.error||'Log is empty';$('log-note').textContent=d.truncated?'Showing the last 64 KiB. Open the local log for full output.':'Latest saved output · reopen to refresh'}catch{$('log-text').textContent='Could not read the log'}});
 $('close-log').addEventListener('click',()=>$('logs').close());
 function failureText(d){if(d.error)return d.error;const x=d.diagnosis||{},p=d.progress,c=d.checkpoint||{};return [
@@ -312,11 +347,13 @@ document.addEventListener('click',async event=>{
  if(move){const previous=latestData.jobs.filter(j=>j.status==='queued').map(j=>j.id),ids=[...previous];const i=Number(move.dataset.order),target=i+Number(move.dataset.step);if(target<0||target>=ids.length)return;[ids[i],ids[target]]=[ids[target],ids[i]];path='/api/queue/order';body={job_ids:ids,expected_order:previous};}
  else {path='/api/jobs/'+action.dataset.job+'/'+action.dataset.action;body={};}
  controlBusy=true;render(latestData);$('control-message').textContent='Saving queue change…';
- try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-GPU-Queue-Token':latestData.control_token},body:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw Error(d.error||'Queue changed; refresh and retry');$('control-message').textContent=d.status==='pause_requested'?'Pause requested. Waiting for the job to checkpoint and exit.':d.resumed_from?'Checkpoint resume queued as job #'+d.job_id:'Queue change saved.';}
+ try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-GPU-Queue-Token':latestData.control_token},body:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw Error(d.error||'Queue changed; refresh and retry');$('control-message').textContent=d.status==='pause_requested'?'Pause requested. Waiting for the job to checkpoint and exit.':d.resumed_from?'Checkpoint resume queued as job #'+d.job_id:'archived' in d?(d.archived?'Job archived. Logs and links retained.':'Job restored to history.'):'Queue change saved.';}
  catch(e){$('control-message').textContent=e.message;}
- finally{controlBusy=false;try{const r=await fetch('/api/status');render(await r.json())}catch{}}
+ finally{controlBusy=false;try{const r=await fetch(statusUrl());render(await r.json())}catch{}}
 });
-async function refresh(){try{const r=await fetch('/api/status');if(!r.ok)throw Error();render(await r.json())}catch{$('connection').textContent='Disconnected · retrying';$('issues').textContent='Cannot reach the local dashboard. Displayed information may be stale.'}finally{setTimeout(refresh,3000)}}refresh();'''
+function statusUrl(){return '/api/status'+($('show-archived').checked?'?include_archived=1':'')}
+$('show-archived').addEventListener('change',async()=>{try{const r=await fetch(statusUrl());if(r.ok)render(await r.json())}catch{}});
+async function refresh(){try{const r=await fetch(statusUrl());if(!r.ok)throw Error();render(await r.json())}catch{$('connection').textContent='Disconnected · retrying';$('issues').textContent='Cannot reach the local dashboard. Displayed information may be stale.'}finally{setTimeout(refresh,3000)}}refresh();'''
 
 
 if __name__ == '__main__':

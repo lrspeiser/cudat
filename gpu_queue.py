@@ -55,7 +55,7 @@ def connect(state=None):
                            'resumed_as': 'INTEGER', 'share_gpu': 'INTEGER DEFAULT 0',
                            'compute_percent': 'REAL DEFAULT 100', 'requester': 'TEXT',
                            'retry_of': 'INTEGER', 'retry_key': 'TEXT', 'retry_signature': 'TEXT',
-                           'depends_on': "TEXT DEFAULT '[]'"}.items():
+                           'depends_on': "TEXT DEFAULT '[]'", 'archived_at': 'REAL'}.items():
             if name not in columns:
                 db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {kind}')
         db.execute('CREATE TABLE IF NOT EXISTS queue_events (time REAL, action TEXT, data TEXT)')
@@ -77,6 +77,34 @@ def event(db, action, **data):
 
 def next_order(db):
     return db.execute('SELECT COALESCE(MAX(COALESCE(queue_order,id)),0)+1 FROM jobs').fetchone()[0]
+
+
+def display_status(job):
+    """Keep scheduler states stable while identifying historical pause records."""
+    return 'resumed' if job.get('status') == 'paused' and job.get('resumed_as') else job.get('status')
+
+
+def set_archived(db, job_ids, archived=True):
+    """Hide history without deleting evidence or changing scheduling/lineage."""
+    if (not isinstance(job_ids, list) or not job_ids
+            or any(type(j) is not int or not 1 <= j <= 2**63-1 for j in job_ids)
+            or len(set(job_ids)) != len(job_ids)):
+        raise ValueError('Provide distinct positive job IDs')
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        rows = [db.execute('SELECT * FROM jobs WHERE id=?', (jid,)).fetchone() for jid in job_ids]
+        for jid, row in zip(job_ids, rows):
+            if row is None:
+                raise ValueError(f'Unknown job {jid}; no archive changes made')
+            finished = row['status'] in (*gpu_failures.FAILURE_STATES, 'completed', 'cancelled')
+            if archived and not (finished or (row['status'] == 'paused' and row['resumed_as'])):
+                raise ValueError(f'Job {jid} is still active or resumable; no archive changes made')
+        changed = [row['id'] for row in rows if bool(row['archived_at']) != archived]
+        stamp = time.time() if archived else None
+        db.executemany('UPDATE jobs SET archived_at=? WHERE id=?', ((stamp, jid) for jid in changed))
+        if changed:
+            event(db, 'archive' if archived else 'restore', job_ids=changed)
+    return dict(job_ids=job_ids, archived=archived)
 
 
 def reorder(db, job_ids, expected_order=None):
@@ -227,6 +255,8 @@ def resume(db, jid):
 def with_progress(row):
     """Attach optional self-reported progress without changing original budgets."""
     data = dict(row)
+    if 'status' in data:
+        data['display_status'] = display_status(data)
     try:
         progress = json.loads((STATE / 'jobs' / str(int(data['id'])) / 'progress.json').read_text(encoding='utf-8'))
         if isinstance(progress, dict):
@@ -508,7 +538,7 @@ def worker(args, db):
         baseline = 0.0
         def heartbeat(state, detail):
             payload = dict(time=time.time(), state=state, detail=detail, reserve_gb=args.reserve_gb,
-                version='0.4.0', queue_order_supported=True, sharing_supported=True, failure_notifications_supported=True,
+                version='0.4.1', queue_order_supported=True, sharing_supported=True, failure_notifications_supported=True,
                 max_parallel=args.max_parallel, compute_reserve_percent=args.compute_reserve_percent,
                 running_job_ids=list(running))
             pending = STATE / 'worker.tmp'
@@ -635,6 +665,7 @@ def main():
     work.add_argument('--once', action='store_true', help='Drain queue then exit; waits if head job cannot fit yet.')
     status_parser = commands.add_parser('status')
     status_parser.add_argument('--json', action='store_true', help='Emit one machine-readable state snapshot.')
+    status_parser.add_argument('--include-archived', action='store_true', help='Include archived history (logs and links are always retained).')
     watch = commands.add_parser('watch', help='Live system GPU processes, including outside queue users.')
     watch.add_argument('--interval', type=positive, default=5)
     watch.add_argument('--once', action='store_true', help='Take a fresh sample and exit.')
@@ -645,6 +676,9 @@ def main():
     order = commands.add_parser('reorder', help='Supply all currently queued IDs in desired execution order.')
     order.add_argument('job_ids', type=int, nargs='+')
     order.add_argument('--expected-order', type=int, nargs='*', help='Reject if the queue has changed since this snapshot.')
+    for name in ('archive', 'restore'):
+        history = commands.add_parser(name, help='Hide finished history without deleting evidence.' if name == 'archive' else 'Show archived history again.')
+        history.add_argument('job_ids', type=int, nargs='+')
     again = commands.add_parser('retry', help='Create an explicit linked retry; original failure and logs are retained.')
     again.add_argument('id', type=int)
     again.add_argument('--retry-key', required=True, help='Stable idempotency key for this repair attempt.')
@@ -705,6 +739,8 @@ def main():
         print(json.dumps(gpu_failures.acknowledge(db,args.requester,args.id)))
     elif args.action == 'reorder':
         print(json.dumps(dict(queued_job_ids=reorder(db, args.job_ids, args.expected_order))))
+    elif args.action in ('archive', 'restore'):
+        print(json.dumps(set_archived(db, args.job_ids, archived=args.action == 'archive')))
     elif args.action in ('pause', 'resume'):
         print(json.dumps((pause if args.action == 'pause' else resume)(db, args.id)))
     elif args.action == 'worker':
@@ -731,6 +767,9 @@ def main():
         (STATE / 'stop-requested').touch()
         print('Worker will stop after the current job. Use cancel ID to stop a running job early.')
     elif args.action == 'status':
+        visible = '' if args.include_archived else ' WHERE archived_at IS NULL'
+        rows = db.execute('SELECT * FROM jobs' + visible + ' ORDER BY id DESC LIMIT 50').fetchall()
+        archived_count = db.execute('SELECT COUNT(*) FROM jobs WHERE archived_at IS NOT NULL').fetchone()[0]
         running = False
         try:
             with worker_lock():
@@ -741,14 +780,20 @@ def main():
             import gpu_monitor
             print(json.dumps(dict(state_dir=str(STATE), worker_running=running,
                 queued_job_ids=queued_ids(db),
-                jobs=[with_progress(r) for r in db.execute('SELECT * FROM jobs ORDER BY id DESC LIMIT 50')],
+                jobs=[with_progress(r) for r in rows], archived_count=archived_count,
                 gpu_snapshot=gpu_monitor.latest(STATE, db, gpu))))
             return 0
         print('Worker: running' if running else 'Worker: stopped (queued jobs will wait)')
         print('Waiting order: ' + ', '.join(map(str, queued_ids(db))))
-        print('ID   STATUS        PROJECT                  EST/ACT seconds   BUDGET/PEAK GiB')
-        for r in db.execute('SELECT * FROM jobs ORDER BY id DESC LIMIT 50'):
-            print(f"{r['id']:<4} {r['status']:<13} {r['project'][:24]:<24} {r['seconds']:>7.1f}/{r['elapsed']:<7.1f} {r['vram']:>6.2f}/{r['peak']:.2f}")
+        print(f'Archived history: {archived_count} jobs (status --include-archived to show)')
+        print('ID   STATE                 PROJECT                  EST/ACT seconds   BUDGET/PEAK GiB')
+        for r in rows:
+            label = display_status(dict(r))
+            if label == 'resumed':
+                label = f'resumed -> #{r["resumed_as"]}'
+            if r['archived_at']:
+                label += ' (archived)'
+            print(f"{r['id']:<4} {label:<21} {r['project'][:24]:<24} {r['seconds']:>7.1f}/{r['elapsed']:<7.1f} {r['vram']:>6.2f}/{r['peak']:.2f}")
         import gpu_monitor
         gpu_monitor.display(gpu_monitor.latest(STATE, db, gpu))
     else:

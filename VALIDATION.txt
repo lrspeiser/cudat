@@ -1,4 +1,18 @@
-Release candidate 0.4.0 — 18 October 2026
+Release 0.4.1 — 18 October 2026
+
+Archive update verified:
+- 45 unittest tests passed on Windows Python 3.13 using an isolated export of the staged release.
+- Archive/restore are atomic, idempotent visibility changes and reject running/queued/resumable jobs.
+- Original rows, artifacts, failure inbox receipts, linked retries and resume/dependency chains are preserved.
+- Direct log/failure URLs work for archived jobs and beyond the recent-history limit.
+- Read-only dashboard supports legacy schemas without migration.
+- Installed 0.4.1 wheel in a separate environment; updated live dashboard and CLI launcher.
+- Browser acceptance: Show archived -> Restore test job -> Archive -> default view.
+- Live cleanup: exactly jobs 2,4,5,6,8,9,10 archived; all 27 artifact hashes and original row fields unchanged.
+- Historical pauses display resumed -> successor in history, retaining raw scheduler status.
+- Existing worker was left running; archive visibility requires only upgraded clients/dashboard.
+
+Earlier 0.4.0 validation — 18 October 2026
 
 Verified:
 - Durable requester inbox, bounded evidence, heuristic diagnosis, acknowledgements and replay safety.
